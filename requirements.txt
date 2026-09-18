@@ -1,0 +1,23 @@
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+torch==2.4.1+cu121
+torchvision==0.19.1+cu121
+
+numpy<2
+
+ninja
+plyfile==0.8.1
+tqdm
+opencv-python==4.8.1.78
+munch
+trimesh
+evo==1.11.0
+open3d==0.18.0
+torchmetrics
+imgviz
+lpips
+rich
+wandb
+PyOpenGL
+glfw
+PyGLM
