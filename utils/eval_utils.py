@@ -54,16 +54,19 @@ def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
     ax = evo.tools.plot.prepare_axis(fig, plot_mode)
     ax.set_title(f"ATE RMSE: {ape_stat}")
     evo.tools.plot.traj(ax, plot_mode, traj_ref, "--", "gray", "gt")
-    evo.tools.plot.traj_colormap(
-        ax,
-        traj_est_aligned,
-        ape_metric.error,
-        plot_mode,
-        min_map=ape_stats["min"],
-        max_map=ape_stats["max"],
+
+    xy = traj_est_aligned.positions_xyz[:, :2]
+    sc = ax.scatter(
+        xy[:, 0], xy[:, 1],
+        c=ape_metric.error, cmap="jet",
+        vmin=ape_stats["min"], vmax=ape_stats["max"],
+        s=6, label="est",
     )
+    fig.colorbar(sc, ax=ax, label="APE [m]")
+
     ax.legend()
     plt.savefig(os.path.join(plot_dir, "evo_2dplot_{}.png".format(str(label))), dpi=90)
+    plt.close(fig)
 
     return ape_stat
 
