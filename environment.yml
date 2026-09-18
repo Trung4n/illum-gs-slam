@@ -6,10 +6,10 @@ dependencies:
   - ninja
   - cuda-toolkit=12.1
   - pip:
-      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - --extra-index-url https://download.pytorch.org/whl/cu121
 
-      - torch==2.10.0+cu128
-      - torchvision==0.19.1+cu128
+      - torch==2.4.1+cu121
+      - torchvision==0.19.1+cu121
 
       - numpy<2
 
