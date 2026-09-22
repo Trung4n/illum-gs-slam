@@ -203,6 +203,12 @@ if __name__ == "__main__":
     parser = ArgumentParser(description="Training script parameters")
     parser.add_argument("--config", type=str)
     parser.add_argument("--eval", action="store_true")
+    parser.add_argument(
+        "--dataset_path",
+        type=str,
+        default=None,
+        help="Override Dataset.dataset_path from the config file",
+    )
 
     args = parser.parse_args(sys.argv[1:])
 
@@ -212,6 +218,8 @@ if __name__ == "__main__":
         config = yaml.safe_load(yml)
 
     config = load_config(args.config)
+    if args.dataset_path is not None:
+        config["Dataset"]["dataset_path"] = args.dataset_path
     save_dir = None
 
     if args.eval:
@@ -229,9 +237,10 @@ if __name__ == "__main__":
     if config["Results"]["save_results"]:
         mkdir_p(config["Results"]["save_dir"])
         current_datetime = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-        path = config["Dataset"]["dataset_path"].split("/")
+        dataset_path = os.path.normpath(config["Dataset"]["dataset_path"])
+        path = dataset_path.split(os.sep)
         save_dir = os.path.join(
-            config["Results"]["save_dir"], path[-3] + "_" + path[-2], current_datetime
+            config["Results"]["save_dir"], path[-2] + "_" + path[-1], current_datetime
         )
         tmp = args.config
         tmp = tmp.split(".")[0]
