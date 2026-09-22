@@ -24,6 +24,7 @@ from utils.slam_frontend import FrontEnd
 
 class SLAM:
     def __init__(self, config, save_dir=None):
+        # CUDA events used to time the whole run (start..end) for the FPS report below.
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
 
@@ -31,6 +32,9 @@ class SLAM:
 
         self.config = config
         self.save_dir = save_dir
+        # Split the flat YAML config into the 3 sub-dicts used by 3DGS internals
+        # (gaussian model I/O, optimizer hyperparams, rasterizer pipeline flags).
+        # munchify() lets them be accessed as attributes (e.g. opt_params.iterations).
         model_params = munchify(config["model_params"])
         opt_params = munchify(config["opt_params"])
         pipeline_params = munchify(config["pipeline_params"])
@@ -40,35 +44,49 @@ class SLAM:
             pipeline_params,
         )
 
+        # live_mode: reading frames from a live RealSense camera instead of a dataset folder.
         self.live_mode = self.config["Dataset"]["type"] == "realsense"
+        # monocular: True for RGB-only input (no depth sensor available).
+        # This flag changes both the tracking/mapping loss and the keyframe/init logic.
         self.monocular = self.config["Dataset"]["sensor_type"] == "monocular"
         self.use_spherical_harmonics = self.config["Training"]["spherical_harmonics"]
         self.use_gui = self.config["Results"]["use_gui"]
         if self.live_mode:
+            # live demo always needs the viewer to monitor tracking quality
             self.use_gui = True
         self.eval_rendering = self.config["Results"]["eval_rendering"]
 
+        # sh_degree: 0 = only the DC (flat color) term, 3 = full view-dependent color.
         model_params.sh_degree = 3 if self.use_spherical_harmonics else 0
 
+        # The single Gaussian map shared by both frontend (read-only, for tracking)
+        # and backend (read-write, for mapping/optimization).
         self.gaussians = GaussianModel(model_params.sh_degree, config=self.config)
-        self.gaussians.init_lr(6.0)
+        self.gaussians.init_lr(6.0)  # spatial_lr_scale, scales the xyz/scaling learning rates
         self.dataset = load_dataset(
             model_params, model_params.source_path, config=config
         )
 
         self.gaussians.training_setup(opt_params)
-        bg_color = [0, 0, 0]
+        bg_color = [0, 0, 0]  # black background used during rasterization
         self.background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+        # Inter-process message queues: frontend <-> backend.
+        # frontend_queue carries backend->frontend updates (new gaussians/poses).
+        # backend_queue carries frontend->backend requests (init/keyframe/pause/stop).
         frontend_queue = mp.Queue()
         backend_queue = mp.Queue()
 
+        # GUI queues; replaced by a no-op FakeQueue when the GUI is disabled so
+        # frontend/backend code can push to them unconditionally without branching.
         q_main2vis = mp.Queue() if self.use_gui else FakeQueue()
         q_vis2main = mp.Queue() if self.use_gui else FakeQueue()
 
         self.config["Results"]["save_dir"] = save_dir
         self.config["Training"]["monocular"] = self.monocular
 
+        # Frontend = tracking (runs in the main process via frontend.run() below).
+        # Backend  = mapping/BA (runs in its own mp.Process, started further down).
         self.frontend = FrontEnd(self.config)
         self.backend = BackEnd(self.config)
 
@@ -83,6 +101,8 @@ class SLAM:
 
         self.backend.gaussians = self.gaussians
         self.backend.background = self.background
+        # cameras_extent: rough scene radius, used to scale densify/prune distance
+        # thresholds (init_gaussian_extent, gaussian_extent) in set_hyperparams().
         self.backend.cameras_extent = 6.0
         self.backend.pipeline_params = self.pipeline_params
         self.backend.opt_params = self.opt_params
@@ -92,6 +112,8 @@ class SLAM:
 
         self.backend.set_hyperparams()
 
+        # Bundle of everything the GUI process needs; passed once at process start
+        # since GUI runs in a separate process and can't share Python objects directly.
         self.params_gui = gui_utils.ParamsGUI(
             pipe=self.pipeline_params,
             background=self.background,
@@ -104,10 +126,13 @@ class SLAM:
         if self.use_gui:
             gui_process = mp.Process(target=slam_gui.run, args=(self.params_gui,))
             gui_process.start()
-            time.sleep(5)
+            time.sleep(5)  # give the GUI window/OpenGL context time to initialize
 
         backend_process.start()
+        # Blocking call: drives the whole tracking loop over the dataset in this
+        # (main) process until every frame has been consumed.
         self.frontend.run()
+        # Dataset exhausted: tell the backend to stop its background mapping loop.
         backend_queue.put(["pause"])
 
         end.record()
@@ -119,6 +144,8 @@ class SLAM:
         Log("Total FPS", N_frames / (start.elapsed_time(end) * 0.001), tag="Eval")
 
         if self.eval_rendering:
+            # Snapshot the map/trajectory as produced live by tracking, before any
+            # extra offline refinement, to measure "online" SLAM quality.
             self.gaussians = self.frontend.gaussians
             kf_indices = self.frontend.kf_indices
             ATE = eval_ate(
@@ -154,6 +181,8 @@ class SLAM:
             # re-used the frontend queue to retrive the gaussians from the backend.
             while not frontend_queue.empty():
                 frontend_queue.get()
+            # Ask backend to run offline "color refinement" (26k iters, standard 3DGS
+            # photometric optimization with poses frozen) to get the "after" metrics.
             backend_queue.put(["color_refinement"])
             while True:
                 if frontend_queue.empty():
@@ -186,6 +215,7 @@ class SLAM:
             wandb.log({"Metrics": metrics_table})
             save_gaussians(self.gaussians, self.save_dir, "final_after_opt", final=True)
 
+        # Clean shutdown: stop the backend process, then the GUI process (if any).
         backend_queue.put(["stop"])
         backend_process.join()
         Log("Backend stopped and joined the main thread")

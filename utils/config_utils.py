@@ -31,7 +31,7 @@ def load_config(path, default_path=None):
     update_recursive(cfg, cfg_special)
 
     return cfg
-
+ 
 
 def update_recursive(dict1, dict2):
     """
