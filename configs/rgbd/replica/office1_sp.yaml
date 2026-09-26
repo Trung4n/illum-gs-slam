@@ -1,5 +1,4 @@
 inherit_from: "configs/rgbd/replica/base_config.yaml"
 Dataset:
   dataset_path: "datasets/replica/office1/"
-Training:
   single_thread: True
