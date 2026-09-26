@@ -1,5 +1,3 @@
 inherit_from: "configs/mono/replica/base_config.yaml"
 Dataset:
   dataset_path: "datasets/replica/room1/"
-Training:
-  single_thread: False

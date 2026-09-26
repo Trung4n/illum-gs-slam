@@ -6,6 +6,22 @@ from utils.slam_utils import image_gradient, image_gradient_mask
 
 
 class Camera(nn.Module):
+    """One video frame plus everything needed to render/optimize it.
+
+    A Camera bundles: the GT image/depth for this frame, its intrinsics
+    (shared by every frame from the same dataset) and its extrinsics (pose),
+    which is the thing tracking actually estimates. It subclasses nn.Module
+    only so its pose-delta/exposure tensors are proper nn.Parameter objects
+    (get gradients, move with .to(device), etc.) — frontend/backend build
+    their own torch.optim.Adam over a hand-picked subset of these parameters
+    rather than calling camera.parameters(), so there is no forward().
+
+    One Camera instance is created per dataset frame (see
+    init_from_dataset, called from FrontEnd.run()) and lives in
+    FrontEnd.cameras / BackEnd.viewpoints for the rest of the run; clean()
+    releases its heavy tensors if the frame is not turned into a keyframe.
+    """
+
     def __init__(
         self,
         uid,
@@ -24,19 +40,41 @@ class Camera(nn.Module):
         device="cuda:0",
     ):
         super(Camera, self).__init__()
+        # uid: this frame's index in the dataset. Doubles as its identity key
+        # everywhere else in the pipeline (FrontEnd.cameras dict, keyframe
+        # window lists, occ_aware_visibility dict, optimizer param-group names
+        # like f"rot_{uid}").
         self.uid = uid
         self.device = device
 
+        # R, T: CURRENT ESTIMATED world-to-camera pose (rotation, translation),
+        # i.e. what tracking/BA is solving for. Initialized to identity here;
+        # tracking() immediately overwrites it via update_RT() with the
+        # previous frame's pose before optimizing. Plain tensors (not
+        # nn.Parameter) because they are updated manually in pose_utils.update_pose,
+        # not through autograd.
         T = torch.eye(4, device=device)
         self.R = T[:3, :3]
         self.T = T[:3, 3]
+        # R_gt, T_gt: GROUND-TRUTH pose, constant for this frame's lifetime.
+        # Only used to (a) bootstrap frame 0 / the init window and (b) as the
+        # reference trajectory for ATE evaluation — never fed into the
+        # tracking/mapping loss itself.
         self.R_gt = gt_T[:3, :3]
         self.T_gt = gt_T[:3, 3]
 
+        # original_image: GT color tensor (CHW, float in [0,1]) for this frame.
         self.original_image = color
+        # depth: GT depth map (numpy array) if the sensor provides one, else None
+        # (monocular) — filled in by MonocularDataset.__getitem__.
         self.depth = depth
+        # grad_mask: high-image-gradient pixel mask, filled in later by
+        # compute_grad_mask(); restricts the monocular tracking loss to
+        # textured/edge regions.
         self.grad_mask = None
 
+        # Intrinsics, copied from the dataset (identical for every Camera
+        # built from the same dataset instance).
         self.fx = fx
         self.fy = fy
         self.cx = cx
@@ -46,6 +84,16 @@ class Camera(nn.Module):
         self.image_height = image_height
         self.image_width = image_width
 
+        # cam_rot_delta / cam_trans_delta: the actual OPTIMIZATION VARIABLES
+        # for tracking. NOT the pose itself — a small se(3) tangent-space
+        # increment (axis-angle rotation + translation) around the current
+        # R,T. Each tracking/mapping optimizer step: render at the current
+        # R,T (the rasterizer's forward pass ignores the delta's value) ->
+        # backward, where the rasterizer writes dLoss/d(delta), evaluated at
+        # delta = 0, into these tensors' .grad -> Adam.step() moves them ->
+        # pose_utils.update_pose() folds the delta into R,T via SE3_exp() and
+        # resets it to zero. A delta that is stepped but never folded has no
+        # effect at all on rendering.
         self.cam_rot_delta = nn.Parameter(
             torch.zeros(3, requires_grad=True, device=device)
         )
@@ -53,6 +101,10 @@ class Camera(nn.Module):
             torch.zeros(3, requires_grad=True, device=device)
         )
 
+        # exposure_a, exposure_b: learnable per-frame affine brightness
+        # correction, image_ab = exp(a) * image + b (see get_loss_tracking /
+        # get_loss_mapping). Compensates auto-exposure/white-balance changes
+        # between frames so the photometric loss compares like with like.
         self.exposure_a = nn.Parameter(
             torch.tensor([0.0], requires_grad=True, device=device)
         )
@@ -60,10 +112,15 @@ class Camera(nn.Module):
             torch.tensor([0.0], requires_grad=True, device=device)
         )
 
+        # Perspective projection matrix (shared across all frames of a run,
+        # built once in slam_frontend/slam_gui and passed in here).
         self.projection_matrix = projection_matrix.to(device=device)
 
     @staticmethod
     def init_from_dataset(dataset, idx, projection_matrix):
+        # Factory used by FrontEnd.run(): pulls (image, depth, gt_pose) from
+        # the dataset and pairs it with the dataset's shared intrinsics to
+        # build one Camera per loop iteration.
         gt_color, gt_depth, gt_pose = dataset[idx]
         return Camera(
             idx,
@@ -84,6 +141,9 @@ class Camera(nn.Module):
 
     @staticmethod
     def init_from_gui(uid, T, FoVx, FoVy, fx, fy, cx, cy, H, W):
+        # Factory used by the GUI viewer to build a throwaway Camera for an
+        # arbitrary user-controlled viewpoint (no GT image/depth attached —
+        # this Camera is only ever used to render, never to track/optimize).
         projection_matrix = getProjectionMatrix2(
             znear=0.01, zfar=100.0, fx=fx, fy=fy, cx=cx, cy=cy, W=W, H=H
         ).transpose(0, 1)
@@ -93,10 +153,14 @@ class Camera(nn.Module):
 
     @property
     def world_view_transform(self):
+        # 4x4 view matrix (world -> camera), transposed to match the
+        # rasterizer's expected (row-vector-on-the-left) matrix convention.
         return getWorld2View2(self.R, self.T).transpose(0, 1)
 
     @property
     def full_proj_transform(self):
+        # Combined view + projection matrix (world -> clip space), what the
+        # rasterizer actually uses to place Gaussians on screen.
         return (
             self.world_view_transform.unsqueeze(0).bmm(
                 self.projection_matrix.unsqueeze(0)
@@ -105,13 +169,25 @@ class Camera(nn.Module):
 
     @property
     def camera_center(self):
+        # Camera position in world space, recovered by inverting the view
+        # matrix. Used by the renderer for view-dependent SH color evaluation.
         return self.world_view_transform.inverse()[3, :3]
 
     def update_RT(self, R, t):
+        # Overwrite the current pose estimate outright (as opposed to the
+        # incremental cam_rot_delta/cam_trans_delta above). Called to seed a
+        # new frame with the previous frame's pose, to apply a converged
+        # tracking delta (pose_utils.update_pose), and to apply poses synced
+        # back from the backend after bundle adjustment.
         self.R = R.to(device=self.device)
         self.T = t.to(device=self.device)
 
     def compute_grad_mask(self, config):
+        # Build a mask that marks "informative" (high-texture/edge) pixels,
+        # used to restrict the monocular photometric loss to regions where
+        # gradients actually carry pose information (flat/textureless areas
+        # are ambiguous and would just add noise). Called once per frame,
+        # right after it's created — not recomputed during optimization.
         edge_threshold = config["Training"]["edge_threshold"]
 
         gray_img = self.original_image.mean(dim=0, keepdim=True)
@@ -122,27 +198,40 @@ class Camera(nn.Module):
         img_grad_intensity = torch.sqrt(gray_grad_v**2 + gray_grad_h**2)
 
         if config["Dataset"]["type"] == "replica":
+            # Replica-specific variant: threshold locally per 32x32 grid cell
+            # (each cell's own median) instead of one global median, since
+            # Replica renders have more uniform texture across the frame and
+            # a single global threshold would miss weakly-textured regions.
             row, col = 32, 32
             multiplier = edge_threshold
             _, h, w = self.original_image.shape
+            # Rounded edges so the cells tile the whole image even when h, w
+            # are not multiples of row, col.
+            row_edges = [round(r * h / row) for r in range(row + 1)]
+            col_edges = [round(c * w / col) for c in range(col + 1)]
+            grad_mask = torch.zeros_like(img_grad_intensity, dtype=torch.bool)
             for r in range(row):
+                r0, r1 = row_edges[r], row_edges[r + 1]
                 for c in range(col):
-                    block = img_grad_intensity[
-                        :,
-                        r * int(h / row) : (r + 1) * int(h / row),
-                        c * int(w / col) : (c + 1) * int(w / col),
-                    ]
-                    th_median = block.median()
-                    block[block > (th_median * multiplier)] = 1
-                    block[block <= (th_median * multiplier)] = 0
-            self.grad_mask = img_grad_intensity
+                    c0, c1 = col_edges[c], col_edges[c + 1]
+                    block = img_grad_intensity[:, r0:r1, c0:c1]
+                    grad_mask[:, r0:r1, c0:c1] = block > block.median() * multiplier
+            self.grad_mask = grad_mask
         else:
+            # Generic case: single global-median threshold over the whole image.
             median_img_grad_intensity = img_grad_intensity.median()
             self.grad_mask = (
                 img_grad_intensity > median_img_grad_intensity * edge_threshold
             )
 
     def clean(self):
+        # Explicitly drop references to this frame's heavy CUDA tensors
+        # (image/depth/mask/learnable params). Called by FrontEnd.cleanup()
+        # right after tracking, for every frame that is NOT made a keyframe
+        # (only its R/T are still needed: to seed the next frame's tracking
+        # and for evaluation). Frames stay in FrontEnd.cameras for the whole
+        # run, so without this their GPU memory would never be freed.
+        # Keyframes are never cleaned on the frontend side.
         self.original_image = None
         self.depth = None
         self.grad_mask = None

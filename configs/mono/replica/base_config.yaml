@@ -53,8 +53,8 @@ Training:
   kf_min_translation: 0.02
   kf_overlap: 0.95
   prune_mode: "slam"
-  single_thread: True
-  spherical_harmonics: True
+  sync_mode: "hybrid"
+  spherical_harmonics: False
   lr:
     cam_rot_delta: 0.003
     cam_trans_delta: 0.001
@@ -78,7 +78,7 @@ opt_params:
   densify_grad_threshold: 0.0002
 
 model_params:
-  sh_degree: 3
+  sh_degree: 0
   source_path: ""
   model_path: ""
   resolution: -1

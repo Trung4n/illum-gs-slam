@@ -24,12 +24,6 @@ from utils.slam_frontend import FrontEnd
 
 class SLAM:
     def __init__(self, config, save_dir=None):
-        # CUDA events used to time the whole run (start..end) for the FPS report below.
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-
-        start.record()
-
         self.config = config
         self.save_dir = save_dir
         # Split the flat YAML config into the 3 sub-dicts used by 3DGS internals
@@ -59,13 +53,13 @@ class SLAM:
         # sh_degree: 0 = only the DC (flat color) term, 3 = full view-dependent color.
         model_params.sh_degree = 3 if self.use_spherical_harmonics else 0
 
-        # The single Gaussian map shared by both frontend (read-only, for tracking)
-        # and backend (read-write, for mapping/optimization).
+        # The Gaussian map. Handed to the backend (which owns and optimizes it in
+        # its own process) and to the GUI. The frontend never touches this
+        # object: it tracks against detached snapshots that the backend sends
+        # back through frontend_queue (see FrontEnd.sync_backend).
         self.gaussians = GaussianModel(model_params.sh_degree, config=self.config)
         self.gaussians.init_lr(6.0)  # spatial_lr_scale, scales the xyz/scaling learning rates
-        self.dataset = load_dataset(
-            model_params, model_params.source_path, config=config
-        )
+        self.dataset = load_dataset(model_params, model_params.source_path, config=config)
 
         self.gaussians.training_setup(opt_params)
         bg_color = [0, 0, 0]  # black background used during rasterization
@@ -74,16 +68,24 @@ class SLAM:
         # Inter-process message queues: frontend <-> backend.
         # frontend_queue carries backend->frontend updates (new gaussians/poses).
         # backend_queue carries frontend->backend requests (init/keyframe/pause/stop).
-        frontend_queue = mp.Queue()
-        backend_queue = mp.Queue()
+        # Stored on self so run() (called separately, after __init__ returns) can
+        # still reach them.
+        frontend_queue = self.frontend_queue = mp.Queue()
+        backend_queue = self.backend_queue = mp.Queue()
 
         # GUI queues; replaced by a no-op FakeQueue when the GUI is disabled so
         # frontend/backend code can push to them unconditionally without branching.
-        q_main2vis = mp.Queue() if self.use_gui else FakeQueue()
-        q_vis2main = mp.Queue() if self.use_gui else FakeQueue()
+        q_main2vis = self.q_main2vis = mp.Queue() if self.use_gui else FakeQueue()
+        q_vis2main = self.q_vis2main = mp.Queue() if self.use_gui else FakeQueue()
 
         self.config["Results"]["save_dir"] = save_dir
         self.config["Training"]["monocular"] = self.monocular
+
+        sync_mode = self.config["Training"].get("sync_mode")
+        if sync_mode not in ("parallel", "hybrid", "sequential"):
+            raise ValueError(
+                f"Training.sync_mode must be 'parallel', 'hybrid' or 'sequential', got {sync_mode!r}"
+            )
 
         # Frontend = tracking (runs in the main process via frontend.run() below).
         # Backend  = mapping/BA (runs in its own mp.Process, started further down).
@@ -121,6 +123,17 @@ class SLAM:
             q_main2vis=q_main2vis,
             q_vis2main=q_vis2main,
         )
+
+    def run(self):
+        # CUDA events used to time the whole run (start..end) for the FPS report below.
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+
+        frontend_queue = self.frontend_queue
+        backend_queue = self.backend_queue
+        q_main2vis = self.q_main2vis
+
+        start.record()
 
         backend_process = mp.Process(target=self.backend.run)
         if self.use_gui:
@@ -223,9 +236,6 @@ class SLAM:
             q_main2vis.put(gui_utils.GaussianPacket(finish=True))
             gui_process.join()
             Log("GUI Stopped and joined the main thread")
-
-    def run(self):
-        pass
 
 
 if __name__ == "__main__":

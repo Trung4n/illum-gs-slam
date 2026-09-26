@@ -53,7 +53,7 @@ Training:
   kf_min_translation: 0.02
   kf_overlap: 0.95
   prune_mode: "slam"
-  single_thread: True
+  sync_mode: "hybrid"
   spherical_harmonics: False
   lr:
     cam_rot_delta: 0.003

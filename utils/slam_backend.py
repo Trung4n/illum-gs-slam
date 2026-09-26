@@ -6,70 +6,135 @@ import torch.multiprocessing as mp
 from tqdm import tqdm
 
 from gaussian_splatting.gaussian_renderer import render
+from gaussian_splatting.scene.gaussian_model import GaussianModel
 from gaussian_splatting.utils.loss_utils import l1_loss, ssim
 from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
 from utils.slam_utils import get_loss_mapping
 
-
 class BackEnd(mp.Process):
+    """Mapping half of the SLAM system (runs in its own process).
+
+    The backend owns the Gaussian map and jointly optimizes, over the
+    current keyframe window:
+      - all Gaussian parameters (position, color, opacity, scale, rotation),
+      - the poses of the newest `pose_window` keyframes,
+      - the exposure (a, b) of every keyframe in the window.
+    It also adds Gaussians for each new keyframe, densifies/prunes the map,
+    and periodically sends a detached copy of the map plus the refined
+    keyframe poses back to the frontend (push_to_frontend).
+
+    It is driven by messages on backend_queue ("init", "keyframe", "pause",
+    "unpause", "color_refinement", "stop"). When no message is waiting, it
+    keeps optimizing the current window in the background (multi-thread
+    mode only).
+    """
+
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.gaussians = None
+        # Set from slam.py after construction.
+        self.gaussians : GaussianModel = None  # the map (GaussianModel) - owned by the backend
         self.pipeline_params = None
-        self.opt_params = None
+        self.opt_params = None  # 3DGS optimizer/densification hyperparameters
         self.background = None
+        # Rough scene radius (6.0, hard-coded in slam.py); scales the
+        # densify/prune distance thresholds in set_hyperparams().
         self.cameras_extent = None
-        self.frontend_queue = None
-        self.backend_queue = None
+        self.frontend_queue = None  # backend -> frontend (map snapshots)
+        self.backend_queue = None  # frontend/main -> backend (requests)
+        # live_mode (RealSense): shorter initial BA, see the "keyframe" handler.
         self.live_mode = False
 
         self.pause = False
+        # device/dtype: not used anywhere in the backend.
         self.device = "cuda"
         self.dtype = torch.float32
         self.monocular = config["Training"]["monocular"]
+        # iteration_count: total mapping iterations since the last reset.
+        # Drives the densify / opacity-reset schedules and the xyz learning
+        # rate decay (update_learning_rate).
         self.iteration_count = 0
+        # last_sent: mapping iterations since the last push_to_frontend(); the
+        # background loop pushes a new snapshot every 10 iterations.
         self.last_sent = 0
+        # occ_aware_visibility: {keyframe idx -> (N,) 0/1 tensor} of which
+        # Gaussians each WINDOW keyframe sees (n_touched > 0). Recomputed every
+        # mapping iteration, used for pruning and sent to the frontend for its
+        # keyframe decisions.
         self.occ_aware_visibility = {}
+        # viewpoints: {frame idx -> Camera} for EVERY keyframe received since
+        # the last reset (not just the window). Keyframes outside the window
+        # are still rendered occasionally (2 random ones per iteration) so the
+        # map does not forget old regions, and all of them are used by
+        # color_refinement(). Their images are kept in memory for this.
         self.viewpoints = {}
+        # current_window: the frontend's keyframe window, newest first.
         self.current_window = []
+        # Monocular only becomes initialized after the initial BA over a full
+        # window (see map(prune=True)).
         self.initialized = not self.monocular
+        # keyframe_optimizers: Adam over the window keyframes' pose deltas and
+        # exposures. Rebuilt on every "keyframe" message (see run()).
         self.keyframe_optimizers = None
 
     def set_hyperparams(self):
+        # Not used anywhere in the backend.
         self.save_results = self.config["Results"]["save_results"]
 
+        # --- initial map (initialize_map), single frame ---
+        # number of iterations
         self.init_itr_num = self.config["Training"]["init_itr_num"]
+        # densify/prune every N iterations
         self.init_gaussian_update = self.config["Training"]["init_gaussian_update"]
+        # iteration at which all opacities are reset to 0.01
         self.init_gaussian_reset = self.config["Training"]["init_gaussian_reset"]
+        # min opacity: Gaussians below it are pruned
         self.init_gaussian_th = self.config["Training"]["init_gaussian_th"]
+        # scene extent for the clone/split threshold
         self.init_gaussian_extent = (
             self.cameras_extent * self.config["Training"]["init_gaussian_extent"]
         )
+        # --- regular mapping (map) ---
+        # iterations per keyframe (no background mapping / during mono init)
         self.mapping_itr_num = self.config["Training"]["mapping_itr_num"]
+        # densify/prune when iteration_count % every == offset
         self.gaussian_update_every = self.config["Training"]["gaussian_update_every"]
         self.gaussian_update_offset = self.config["Training"]["gaussian_update_offset"]
+        # min opacity: Gaussians below it are pruned
         self.gaussian_th = self.config["Training"]["gaussian_th"]
+        # scene extent: clone/split threshold (percent_dense * extent) and
+        # world-space size pruning (0.1 * extent)
         self.gaussian_extent = (
             self.cameras_extent * self.config["Training"]["gaussian_extent"]
         )
+        # period (in iterations) of the non-visible opacity reset
         self.gaussian_reset = self.config["Training"]["gaussian_reset"]
+        # max on-screen radius in pixels before a Gaussian is pruned
         self.size_threshold = self.config["Training"]["size_threshold"]
         self.window_size = self.config["Training"]["window_size"]
-        self.single_thread = (
-            self.config["Dataset"]["single_thread"]
-            if "single_thread" in self.config["Dataset"]
-            else False
+        # background_mapping: keep refining the window between keyframes
+        # (see Training.sync_mode).
+        self.background_mapping = self.config["Training"]["sync_mode"] in (
+            "parallel",
+            "hybrid",
         )
 
     def add_next_kf(self, frame_idx, viewpoint, init=False, scale=2.0, depth_map=None):
+        # Adds new Gaussians for a keyframe: back-projects depth_map (prepared
+        # by FrontEnd.add_new_keyframe) with the keyframe's pose, randomly
+        # downsampled (pcd_downsample_init if init, else pcd_downsample), and
+        # tags them with kf_id=frame_idx (GaussianModel.unique_kfIDs, used by
+        # the "slam" pruning below). `scale` only matters when no depth_map
+        # is given, which never happens here.
         self.gaussians.extend_from_pcd_seq(
             viewpoint, kf_id=frame_idx, init=init, scale=scale, depthmap=depth_map
         )
 
     def reset(self):
+        # Wipes the backend state before (re)initialization: all keyframes,
+        # the window, and every Gaussian (all have unique_kfIDs >= 0).
         self.iteration_count = 0
         self.occ_aware_visibility = {}
         self.viewpoints = {}
@@ -84,6 +149,10 @@ class BackEnd(mp.Process):
             self.backend_queue.get()
 
     def initialize_map(self, cur_frame_idx, viewpoint):
+        # Builds the initial map from ONE frame: plain 3DGS-style optimization
+        # of the Gaussians only (the frame is fixed at its GT pose and its
+        # exposure is not used, see initialization=True), for init_itr_num
+        # iterations.
         for mapping_iteration in range(self.init_itr_num):
             self.iteration_count += 1
             render_pkg = render(
@@ -112,6 +181,8 @@ class BackEnd(mp.Process):
             loss_init.backward()
 
             with torch.no_grad():
+                # Densification statistics: largest on-screen radius seen and
+                # accumulated screen-space gradient per Gaussian.
                 self.gaussians.max_radii2D[visibility_filter] = torch.max(
                     self.gaussians.max_radii2D[visibility_filter],
                     radii[visibility_filter],
@@ -119,6 +190,8 @@ class BackEnd(mp.Process):
                 self.gaussians.add_densification_stats(
                     viewspace_point_tensor, visibility_filter
                 )
+                # Clone/split high-gradient Gaussians and prune transparent
+                # ones (no screen-size pruning here: max_screen_size=None).
                 if mapping_iteration % self.init_gaussian_update == 0:
                     self.gaussians.densify_and_prune(
                         self.opt_params.densify_grad_threshold,
@@ -127,6 +200,9 @@ class BackEnd(mp.Process):
                         None,
                     )
 
+                # 3DGS trick: reset every opacity to 0.01 once; Gaussians that
+                # are not needed stay transparent and get pruned at the next
+                # densify_and_prune. (Both thresholds are 500 in the configs.)
                 if self.iteration_count == self.init_gaussian_reset or (
                     self.iteration_count == self.opt_params.densify_from_iter
                 ):
@@ -135,18 +211,36 @@ class BackEnd(mp.Process):
                 self.gaussians.optimizer.step()
                 self.gaussians.optimizer.zero_grad(set_to_none=True)
 
+        # Visibility of the init keyframe, from the last iteration.
         self.occ_aware_visibility[cur_frame_idx] = (n_touched > 0).long()
         Log("Initialized map")
         return render_pkg
 
     def map(self, current_window, prune=False, iters=1):
+        # Joint optimization of the map and the window's keyframes.
+        #
+        # prune=False: `iters` optimization steps (Gaussians, poses of the
+        #   newest pose_window keyframes, exposures), with densify/prune and
+        #   opacity reset on their schedules.
+        # prune=True: a single forward/backward pass used only to recompute
+        #   visibility and remove poorly observed Gaussians (monocular). It
+        #   returns inside the first iteration WITHOUT any optimizer step, so
+        #   `iters` is irrelevant there.
+        #
+        # Returns gaussian_split (True if the Gaussian set changed); no caller
+        # uses it.
         if len(current_window) == 0:
             return
 
         viewpoint_stack = [self.viewpoints[kf_idx] for kf_idx in current_window]
         random_viewpoint_stack = []
+        # Only the newest pose_window keyframes get their pose updated below.
+        # The older window keyframes act as fixed anchors (exposure is still
+        # optimized for them).
         frames_to_optimize = self.config["Training"]["pose_window"]
 
+        # All keyframes outside the window: candidates for the 2 random
+        # "anti-forgetting" views rendered each iteration.
         current_window_set = set(current_window)
         for cam_idx, viewpoint in self.viewpoints.items():
             if cam_idx in current_window_set:
@@ -158,13 +252,17 @@ class BackEnd(mp.Process):
             self.last_sent += 1
 
             loss_mapping = 0
+            # Per-view render outputs, accumulated for densification stats.
             viewspace_point_tensor_acm = []
             visibility_filter_acm = []
             radii_acm = []
+            # Window views only: used for occ_aware_visibility.
             n_touched_acm = []
 
+            # Built but never used.
             keyframes_opt = []
 
+            # 1) Every keyframe in the window.
             for cam_idx in range(len(current_window)):
                 viewpoint = viewpoint_stack[cam_idx]
                 keyframes_opt.append(viewpoint)
@@ -197,6 +295,8 @@ class BackEnd(mp.Process):
                 radii_acm.append(radii)
                 n_touched_acm.append(n_touched)
 
+            # 2) Two random older keyframes (outside the window), so regions
+            # the camera left behind keep being supervised.
             for cam_idx in torch.randperm(len(random_viewpoint_stack))[:2]:
                 viewpoint = random_viewpoint_stack[cam_idx]
                 render_pkg = render(
@@ -226,6 +326,10 @@ class BackEnd(mp.Process):
                 visibility_filter_acm.append(visibility_filter)
                 radii_acm.append(radii)
 
+            # 3) Isotropic regularizer: penalizes each Gaussian's scales for
+            # deviating from their mean, pushing Gaussians toward spheres.
+            # Avoids long thin "needle" Gaussians that fit the training views
+            # but render badly from new viewpoints (which tracking relies on).
             scaling = self.gaussians.get_scaling
             isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
             loss_mapping += 10 * isotropic_loss.mean()
@@ -233,6 +337,8 @@ class BackEnd(mp.Process):
             gaussian_split = False
             ## Deinsifying / Pruning Gaussians
             with torch.no_grad():
+                # Visibility of each window keyframe from this iteration's
+                # renders.
                 self.occ_aware_visibility = {}
                 for idx in range((len(current_window))):
                     kf_idx = current_window[idx]
@@ -245,6 +351,7 @@ class BackEnd(mp.Process):
                     if len(current_window) == self.config["Training"]["window_size"]:
                         prune_mode = self.config["Training"]["prune_mode"]
                         prune_coviz = 3
+                        # n_obs: number of window keyframes seeing each Gaussian.
                         self.gaussians.n_obs.fill_(0)
                         for window_idx, visibility in self.occ_aware_visibility.items():
                             self.gaussians.n_obs += visibility.cpu()
@@ -254,6 +361,14 @@ class BackEnd(mp.Process):
                             # make sure we don't split the gaussians, break here.
                         if prune_mode == "slam":
                             # only prune keyframes which are relatively new
+                            # i.e. Gaussians created by the 3 newest keyframes
+                            # (unique_kfIDs >= 3rd largest window index) that
+                            # are seen by <= 3 window keyframes. In monocular,
+                            # new Gaussians start from a guessed depth; those
+                            # not confirmed by several views are probably at
+                            # the wrong depth. Older Gaussians already
+                            # survived this test and are left alone. Before
+                            # initialization every Gaussian is eligible.
                             sorted_window = sorted(current_window, reverse=True)
                             mask = self.gaussians.unique_kfIDs >= sorted_window[2]
                             if not self.initialized:
@@ -261,19 +376,31 @@ class BackEnd(mp.Process):
                             to_prune = torch.logical_and(
                                 self.gaussians.n_obs <= prune_coviz, mask
                             )
+                        # Only applied in MONOCULAR: with RGB-D the depth is
+                        # measured, so this covisibility pruning is skipped.
                         if to_prune is not None and self.monocular:
                             self.gaussians.prune_points(to_prune.cuda())
+                            # Keep visibility masks aligned with the smaller
+                            # Gaussian set.
                             for idx in range((len(current_window))):
                                 current_idx = current_window[idx]
                                 self.occ_aware_visibility[current_idx] = (
                                     self.occ_aware_visibility[current_idx][~to_prune]
                                 )
+                        # The first prune pass over a full window ends the
+                        # monocular initialization (it follows the initial BA).
                         if not self.initialized:
                             self.initialized = True
                             Log("Initialized SLAM")
                         # # make sure we don't split the gaussians, break here.
+                    # NOTE: returns without optimizer.step() or zero_grad().
+                    # The gradients from this pass stay on the parameters that
+                    # were not replaced by prune_points (the camera deltas
+                    # always, the Gaussians too with RGB-D) and get added to
+                    # the next map() iteration's gradients.
                     return False
 
+                # Densification statistics from all rendered views.
                 for idx in range(len(viewspace_point_tensor_acm)):
                     self.gaussians.max_radii2D[visibility_filter_acm[idx]] = torch.max(
                         self.gaussians.max_radii2D[visibility_filter_acm[idx]],
@@ -283,6 +410,8 @@ class BackEnd(mp.Process):
                         viewspace_point_tensor_acm[idx], visibility_filter_acm[idx]
                     )
 
+                # Clone/split + prune (low opacity, too large on screen or in
+                # the world) on a fixed schedule.
                 update_gaussian = (
                     self.iteration_count % self.gaussian_update_every
                     == self.gaussian_update_offset
@@ -297,6 +426,11 @@ class BackEnd(mp.Process):
                     gaussian_split = True
 
                 ## Opacity reset
+                # Every gaussian_reset iterations: Gaussians seen by NONE of
+                # this iteration's views get their opacity set to 0.4 (visible
+                # ones keep theirs). Unlike vanilla 3DGS, which resets all
+                # opacities to 0.01, this leaves what is currently observed
+                # untouched.
                 if (self.iteration_count % self.gaussian_reset) == 0 and (
                     not update_gaussian
                 ):
@@ -306,10 +440,15 @@ class BackEnd(mp.Process):
 
                 self.gaussians.optimizer.step()
                 self.gaussians.optimizer.zero_grad(set_to_none=True)
+                # Decays the xyz learning rate with the total mapping
+                # iteration count.
                 self.gaussians.update_learning_rate(self.iteration_count)
                 self.keyframe_optimizers.step()
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
                 # Pose update
+                # Fold the stepped deltas into R,T for the newest
+                # pose_window keyframes. Frame 0 is never moved: it anchors
+                # the world frame.
                 for cam_idx in range(min(frames_to_optimize, len(current_window))):
                     viewpoint = viewpoint_stack[cam_idx]
                     if viewpoint.uid == 0:
@@ -318,10 +457,18 @@ class BackEnd(mp.Process):
         return gaussian_split
 
     def color_refinement(self):
+        # Offline refinement run once at the end of an --eval run (requested by
+        # slam.py between the "before" and "after" rendering metrics): 26000
+        # iterations of standard 3DGS training (L1 + D-SSIM with weight
+        # lambda_dssim) on one random keyframe at a time. Only the Gaussians
+        # are optimized: poses are fixed, no exposure correction, no
+        # densification (max_radii2D is updated but unused). The xyz learning
+        # rate schedule restarts from iteration 1.
         Log("Starting color refinement")
 
         iteration_total = 26000
         for iteration in tqdm(range(1, iteration_total + 1)):
+            # Picks one random keyframe (same as random.choice).
             viewpoint_idx_stack = list(self.viewpoints.keys())
             viewpoint_cam_idx = viewpoint_idx_stack.pop(
                 random.randint(0, len(viewpoint_idx_stack) - 1)
@@ -353,6 +500,11 @@ class BackEnd(mp.Process):
         Log("Map refinement done")
 
     def push_to_frontend(self, tag=None):
+        # Sends [tag, map copy, window visibility, window keyframe poses] to
+        # the frontend (applied there by FrontEnd.sync_backend). The map is
+        # deep-copied with detached tensors (clone_obj), so the frontend gets
+        # a frozen snapshot. tag: "init" / "keyframe" answer the matching
+        # request; "sync_backend" is a periodic or color-refinement update.
         self.last_sent = 0
         keyframes = []
         for kf_idx in self.current_window:
@@ -365,8 +517,13 @@ class BackEnd(mp.Process):
         self.frontend_queue.put(msg)
 
     def run(self):
+        # Process entry point. Messages take priority; when the queue is empty
+        # the backend keeps refining the current window.
         while True:
             if self.backend_queue.empty():
+                # Idle cases: paused, nothing to map yet, or no background
+                # mapping (mapping then only happens inside the "keyframe"
+                # handler).
                 if self.pause:
                     time.sleep(0.01)
                     continue
@@ -374,9 +531,13 @@ class BackEnd(mp.Process):
                     time.sleep(0.01)
                     continue
 
-                if self.single_thread:
+                if not self.background_mapping:
                     time.sleep(0.01)
                     continue
+                # Background mapping: one iteration at a time, so a new
+                # message is picked up quickly. Every 10 iterations: a prune
+                # pass (a single pass despite iters=10, see map()) and a new
+                # snapshot for the frontend.
                 self.map(self.current_window)
                 if self.last_sent >= 10:
                     self.map(self.current_window, prune=True, iters=10)
@@ -390,9 +551,12 @@ class BackEnd(mp.Process):
                 elif data[0] == "unpause":
                     self.pause = False
                 elif data[0] == "color_refinement":
+                    # slam.py waits for the resulting "sync_backend" message.
                     self.color_refinement()
                     self.push_to_frontend()
                 elif data[0] == "init":
+                    # From FrontEnd.request_init: start a new map from one
+                    # frame (at its GT pose).
                     cur_frame_idx = data[1]
                     viewpoint = data[2]
                     depth_map = data[3]
@@ -407,6 +571,9 @@ class BackEnd(mp.Process):
                     self.push_to_frontend("init")
 
                 elif data[0] == "keyframe":
+                    # From FrontEnd.request_keyframe: register the keyframe,
+                    # adopt the frontend's new window, add its Gaussians, map,
+                    # prune, reply.
                     cur_frame_idx = data[1]
                     viewpoint = data[2]
                     current_window = data[3]
@@ -418,12 +585,26 @@ class BackEnd(mp.Process):
 
                     opt_params = []
                     frames_to_optimize = self.config["Training"]["pose_window"]
-                    iter_per_kf = self.mapping_itr_num if self.single_thread else 10
+                    # With background mapping: only 10 iterations here, the
+                    # background loop keeps mapping afterwards. Without: the
+                    # full mapping_itr_num, since nothing runs in between.
+                    iter_per_kf = 10 if self.background_mapping else self.mapping_itr_num
                     if not self.initialized:
+                        # Monocular initialization phase.
                         if (
                             len(self.current_window)
                             == self.config["Training"]["window_size"]
                         ):
+                            # Window just became full: initial bundle
+                            # adjustment, meant to optimize the poses of all
+                            # window keyframes except the oldest.
+                            # NOTE: this larger frames_to_optimize only affects
+                            # which deltas are put in the optimizer below.
+                            # map() folds deltas into R,T only for the first
+                            # config pose_window keyframes, and the rasterizer
+                            # ignores the delta values in its forward pass, so
+                            # the extra keyframes' deltas get stepped by Adam
+                            # but never applied to their poses.
                             frames_to_optimize = (
                                 self.config["Training"]["window_size"] - 1
                             )
@@ -431,6 +612,11 @@ class BackEnd(mp.Process):
                             Log("Performing initial BA for initialization")
                         else:
                             iter_per_kf = self.mapping_itr_num
+                    # Optimizer for the window: pose deltas (half the tracking
+                    # learning rate) for the newest frames_to_optimize
+                    # keyframes, exposure for all of them. Frame 0 is skipped
+                    # entirely: its pose and exposure stay fixed as the
+                    # reference.
                     for cam_idx in range(len(self.current_window)):
                         if self.current_window[cam_idx] == 0:
                             continue
@@ -475,6 +661,7 @@ class BackEnd(mp.Process):
                     self.push_to_frontend("keyframe")
                 else:
                     raise Exception("Unprocessed data", data)
+        # "stop": drain both queues so the process can exit cleanly.
         while not self.backend_queue.empty():
             self.backend_queue.get()
         while not self.frontend_queue.empty():

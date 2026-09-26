@@ -207,23 +207,51 @@ class BaseDataset(torch.utils.data.Dataset):
 
 
 class MonocularDataset(BaseDataset):
+    """Base class for single-camera datasets (one color image + optional depth
+    image per frame, both already pixel-aligned — no stereo matching needed).
+
+    This class only sets up calibration/undistortion and defines __getitem__;
+    it does NOT know how to find image files or poses on disk. Concrete
+    subclasses (TUMDataset, ReplicaDataset) must set, after calling
+    super().__init__(): self.num_imgs, self.color_paths, self.depth_paths
+    (may be unused if the sensor has no depth) and self.poses (a list of 4x4
+    numpy arrays, one ground-truth camera-to-world pose per frame).
+
+    Despite the name, this is also the base class used for RGB-D data
+    (sensor_type="depth") whenever depth comes as a single extra image per
+    frame, as opposed to StereoDataset, where depth must be computed from a
+    stereo pair.
+    """
+
     def __init__(self, args, path, config):
         super().__init__(args, path, config)
         calibration = config["Dataset"]["Calibration"]
         # Camera prameters
+        # Pinhole intrinsics (focal lengths / principal point), in pixels.
         self.fx = calibration["fx"]
         self.fy = calibration["fy"]
         self.cx = calibration["cx"]
         self.cy = calibration["cy"]
+        # Expected image resolution. NOTE: not enforced against the actual
+        # image files loaded in __getitem__ — if the config and the dataset
+        # on disk disagree, undistortion/rasterization will silently use the
+        # wrong intrinsics.
         self.width = calibration["width"]
         self.height = calibration["height"]
+        # Vertical/horizontal field of view (radians), derived from focal
+        # length + resolution. Used to build the camera's projection matrix
+        # (see Camera / getProjectionMatrix2), not used in this class itself.
         self.fovx = focal2fov(self.fx, self.width)
         self.fovy = focal2fov(self.fy, self.height)
+        # 3x3 pinhole intrinsic matrix, fed to OpenCV for undistortion below.
         self.K = np.array(
             [[self.fx, 0.0, self.cx], [0.0, self.fy, self.cy], [0.0, 0.0, 1.0]]
         )
         # distortion parameters
+        # disorted: whether raw images need undistortion before use (some
+        # datasets, e.g. Replica, ship already-rectified images).
         self.disorted = calibration["distorted"]
+        # Radial (k1,k2,k3) + tangential (p1,p2) lens distortion coefficients.
         self.dist_coeffs = np.array(
             [
                 calibration["k1"],
@@ -233,6 +261,10 @@ class MonocularDataset(BaseDataset):
                 calibration["k3"],
             ]
         )
+        # Precompute the pixel remap lookup tables once here (expensive),
+        # so __getitem__ only needs a cheap cv2.remap() call per frame.
+        # Undistorts into the same K (no separate "optimal" intrinsics here,
+        # unlike StereoDataset).
         self.map1x, self.map1y = cv2.initUndistortRectifyMap(
             self.K,
             self.dist_coeffs,
@@ -242,10 +274,18 @@ class MonocularDataset(BaseDataset):
             cv2.CV_32FC1,
         )
         # depth parameters
+        # has_depth: RGB-D sensors provide a "depth_scale" in their config;
+        # pure monocular RGB configs omit it, so depth is never read/returned.
         self.has_depth = True if "depth_scale" in calibration.keys() else False
+        # Divisor that converts the raw depth image's integer pixel values
+        # into metric depth (meters), e.g. depth_png / depth_scale.
         self.depth_scale = calibration["depth_scale"] if self.has_depth else None
 
         # Default scene scale
+        # Rough placeholder scene radius/center, in the original 3DGS "Scene"
+        # convention. Not read anywhere else in this codebase (MonoGS derives
+        # its own scene scale from cameras_extent in slam.py instead) — kept
+        # only for structural compatibility with upstream 3DGS.
         nerf_normalization_radius = 5
         self.scene_info = {
             "nerf_normalization": {
@@ -255,19 +295,27 @@ class MonocularDataset(BaseDataset):
         }
 
     def __getitem__(self, idx):
+        # Ground-truth pose for this frame, used by the frontend to initialize
+        # camera 0 and, more generally, only as the evaluation reference (ATE) —
+        # tracking itself estimates the pose independently via optimization.
         color_path = self.color_paths[idx]
         pose = self.poses[idx]
 
+        # Load color as-is (uint8 HWC); no resizing to match self.width/height.
         image = np.array(Image.open(color_path))
         depth = None
 
         if self.disorted:
+            # Apply the undistortion maps precomputed once in __init__.
             image = cv2.remap(image, self.map1x, self.map1y, cv2.INTER_LINEAR)
 
         if self.has_depth:
+            # Raw depth image (e.g. 16-bit PNG) -> metric depth via depth_scale.
             depth_path = self.depth_paths[idx]
             depth = np.array(Image.open(depth_path)) / self.depth_scale
 
+        # HWC uint8 [0,255] -> CHW float32 tensor in [0,1] on the target device;
+        # this is the tensor format expected by the rasterizer/loss functions.
         image = (
             torch.from_numpy(image / 255.0)
             .clamp(0.0, 1.0)
@@ -373,6 +421,7 @@ class StereoDataset(BaseDataset):
         if self.disorted:
             image = cv2.remap(image, self.map1x, self.map1y, cv2.INTER_LINEAR)
             image_r = cv2.remap(image_r, self.map1x_r, self.map1y_r, cv2.INTER_LINEAR)
+            
         stereo = cv2.StereoSGBM_create(minDisparity=0, numDisparities=64, blockSize=20)
         stereo.setUniquenessRatio(40)
         disparity = stereo.compute(image, image_r) / 16.0
@@ -485,9 +534,6 @@ class RealsenseDataset(BaseDataset):
             )
             self.depth_intrinsics = self.depth_profile.get_intrinsics()
         
-        
-
-
     def __getitem__(self, idx):
         pose = torch.eye(4, device=self.device, dtype=self.dtype)
         depth = None
@@ -519,7 +565,7 @@ class RealsenseDataset(BaseDataset):
         return image, depth, pose
 
 
-def load_dataset(args, path, config):
+def load_dataset(args, path, config) -> BaseDataset:
     if config["Dataset"]["type"] == "tum":
         return TUMDataset(args, path, config)
     elif config["Dataset"]["type"] == "replica":

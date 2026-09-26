@@ -34,7 +34,7 @@ Training:
   pose_window: 3
   edge_threshold: 1.1
   rgb_boundary_threshold: 0.01
-  single_thread: False
+  sync_mode: "parallel"
   spherical_harmonics: True
 
   kf_translation: 0.05

@@ -44,7 +44,7 @@ Training:
   kf_overlap: 0.9
   kf_cutoff: 0.3
   prune_mode: 'slam'
-  single_thread: False
+  sync_mode: "parallel"
   spherical_harmonics: False
   lr:
     cam_rot_delta: 0.003
