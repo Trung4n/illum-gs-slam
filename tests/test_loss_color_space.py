@@ -46,17 +46,20 @@ def _viewpoint(seed=0):
 
 
 def _render_pkg(seed=1, with_linear=False):
+    # The rendered images require grad, as they do in SLAM (they come out of
+    # the rasterizer): without it a loss with no exposure term would have no
+    # autograd graph at all and .backward() would fail.
     g = torch.Generator().manual_seed(seed)
     pkg = {
         "depth": torch.rand(1, H, W, generator=g).cuda(),
         "opacity": torch.rand(1, H, W, generator=g).cuda(),
     }
     if with_linear:
-        radiance = torch.rand(3, H, W, generator=g).cuda()
+        radiance = torch.rand(3, H, W, generator=g).cuda().requires_grad_(True)
         pkg["radiance_linear"] = radiance
         pkg["render"] = linear2sRGB(radiance)
     else:
-        pkg["render"] = torch.rand(3, H, W, generator=g).cuda()
+        pkg["render"] = torch.rand(3, H, W, generator=g).cuda().requires_grad_(True)
     return pkg
 
 
@@ -128,6 +131,7 @@ def test_mask_uses_observed_image_not_linearized_target():
     pkg, vp = _render_pkg(with_linear=True), _viewpoint()
     vp.original_image[:, 1, 1] = RGB_BOUNDARY  # sum = 3 * thr > thr
     assert sRGB2Linear(vp.original_image[:, 1, 1]).sum() < RGB_BOUNDARY
-    pkg["radiance_linear"] = pkg["radiance_linear"].clone().requires_grad_(True)
+    # A fresh leaf, so its .grad is kept after backward().
+    pkg["radiance_linear"] = pkg["radiance_linear"].detach().clone().requires_grad_(True)
     get_loss_mapping(_config("linear", affine=False), pkg, vp).backward()
     assert pkg["radiance_linear"].grad[:, 1, 1].abs().sum() > 0
