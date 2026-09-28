@@ -41,6 +41,9 @@ class FrontEnd(mp.Process):
         # Set from slam.py after construction (same wiring as BackEnd).
         self.background = None
         self.pipeline_params = None
+        # self.shader is also set from slam.py, deliberately NOT initialized
+        # here: None means "original MonoGS", so a forgotten assignment must
+        # raise AttributeError instead of silently disabling the light model.
         self.frontend_queue = None  # backend -> frontend messages (map snapshots)
         self.backend_queue = None  # frontend -> backend requests (init/keyframe/...)
         self.q_main2vis = None  # frontend -> GUI packets
@@ -258,7 +261,11 @@ class FrontEnd(mp.Process):
         pose_optimizer = torch.optim.Adam(opt_params)
         for tracking_itr in range(self.tracking_itr_num):
             render_pkg = render(
-                viewpoint, self.gaussians, self.pipeline_params, self.background
+                viewpoint,
+                self.gaussians,
+                self.pipeline_params,
+                self.background,
+                shader=self.shader,
             )
             image, depth, opacity = (
                 render_pkg["render"],
@@ -266,9 +273,7 @@ class FrontEnd(mp.Process):
                 render_pkg["opacity"],
             )
             pose_optimizer.zero_grad()
-            loss_tracking = get_loss_tracking(
-                self.config, image, depth, opacity, viewpoint
-            )
+            loss_tracking = get_loss_tracking(self.config, render_pkg, viewpoint)
             loss_tracking.backward()
 
             with torch.no_grad():

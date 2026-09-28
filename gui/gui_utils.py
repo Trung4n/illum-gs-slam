@@ -167,8 +167,11 @@ class ParamsGUI:
         gaussians=None,
         q_main2vis=None,
         q_vis2main=None,
+        *,
+        shader,
     ):
         self.pipe = pipe
+        self.shader = shader  # light model for render(); None = original MonoGS
         self.background = background
         self.gaussians = gaussians
         self.q_main2vis = q_main2vis

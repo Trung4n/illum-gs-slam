@@ -1,12 +1,65 @@
 import torch
 
+from light_models import read_light_tracking
+from utils.color_space import sRGB2Linear
+
 # Loss functions and image helpers shared by tracking (FrontEnd) and mapping
 # (BackEnd). All losses are plain masked L1 photometric (+ optional depth)
 # errors between a rendered frame and the frame's GT image/depth; the masks
 # are what differ between tracking vs. mapping and monocular vs. RGB-D.
 #
+# Color space (docs/DECISIONS.md D2, D3): the entry points take the whole
+# render_pkg and pick the prediction/target pair themselves according to
+# LightTracking.loss_color_space (get_loss_images), then apply the exposure
+# affine in that same space (apply_exposure_affine). Pixel MASKS, however,
+# are always computed on the observed image as stored (sRGB): their
+# thresholds were chosen for that encoding (CLAUDE.md section 6).
+#
 # Shapes used throughout: images are (3,H,W), depth/opacity maps are
 # (1,H,W), all on CUDA.
+
+
+def get_loss_images(config, render_pkg, viewpoint):
+    # (prediction, target) in the space named by LightTracking.loss_color_space.
+    #   srgb:   "render" (always sRGB, see gaussian_renderer.render) vs the
+    #           observed image as stored. Exactly the baseline pair.
+    #   linear: "radiance_linear" (only present with a shader) vs the
+    #           observed image converted with the ONE sRGB->linear function.
+    target = get_observed_in_loss_space(config, viewpoint)
+    if read_light_tracking(config).loss_color_space == "srgb":
+        return render_pkg["render"], target
+    return render_pkg["radiance_linear"], target
+
+
+def get_observed_in_loss_space(config, viewpoint):
+    # The observed image expressed in LightTracking.loss_color_space: as
+    # stored (sRGB) or converted with the ONE sRGB->linear function.
+    observed = viewpoint.original_image.cuda()
+    if read_light_tracking(config).loss_color_space == "srgb":
+        return observed
+    return sRGB2Linear(observed)
+
+
+def apply_exposure_affine(config, image, viewpoint):
+    # Per-frame affine exposure correction exp(a) * I + b (Camera.exposure_a/b)
+    # applied to the PREDICTION, in the loss color space, right before the
+    # loss. Correction is applied to the render rather than the GT so the map
+    # itself stays exposure-neutral. With LightTracking.exposure_affine: false
+    # nothing is applied: a and b get no gradient and stay at their initial
+    # identity values.
+    if not read_light_tracking(config).exposure_affine:
+        return image
+    return torch.exp(viewpoint.exposure_a) * image + viewpoint.exposure_b
+
+
+def undo_exposure_affine(config, image, viewpoint):
+    # Exact inverse of apply_exposure_affine, in the same (loss) color space:
+    # the prediction that apply_exposure_affine would map onto `image`. Used
+    # to bring an observed image back to the map's exposure-neutral reference
+    # (light_models/albedo_init.py). Identity when exposure_affine is false.
+    if not read_light_tracking(config).exposure_affine:
+        return image
+    return (image - viewpoint.exposure_b) / torch.exp(viewpoint.exposure_a)
 
 
 def image_gradient(image):
@@ -84,35 +137,37 @@ def depth_reg(depth, gt_image, huber_eps=0.1, mask=None):
     return err
 
 
-def get_loss_tracking(config, image, depth, opacity, viewpoint, initialization=False):
+def get_loss_tracking(config, render_pkg, viewpoint):
     # Entry point for the TRACKING loss (called every iteration of
-    # FrontEnd.tracking()). Only the camera pose delta + exposure receive
-    # gradients from it — the Gaussians are frozen during tracking.
+    # FrontEnd.tracking()). Only the camera pose delta (+ exposure if
+    # LightTracking.exposure_affine) receive gradients from it — the
+    # Gaussians are frozen during tracking, and so are the light parameters
+    # (CLAUDE.md section 6).
     #
-    # image_ab: rendered image after the per-frame affine exposure correction
-    # exp(a) * I + b (see Camera.exposure_a/b). Correction is applied to the
-    # RENDER rather than the GT so the map itself stays exposure-neutral.
-    # `initialization` is unused here (kept for signature symmetry with
-    # get_loss_mapping) and no caller passes it: the initialization frame
-    # never goes through tracking — FrontEnd.initialize() assigns it the GT
-    # pose and hands it straight to the backend.
-    image_ab = (torch.exp(viewpoint.exposure_a)) * image + viewpoint.exposure_b
+    # There is no `initialization` case: the initialization frame never goes
+    # through tracking — FrontEnd.initialize() assigns it the GT pose and
+    # hands it straight to the backend.
+    image, gt_image = get_loss_images(config, render_pkg, viewpoint)
+    image = apply_exposure_affine(config, image, viewpoint)
+    depth, opacity = render_pkg["depth"], render_pkg["opacity"]
     if config["Training"]["monocular"]:
-        return get_loss_tracking_rgb(config, image_ab, depth, opacity, viewpoint)
-    return get_loss_tracking_rgbd(config, image_ab, depth, opacity, viewpoint)
+        return get_loss_tracking_rgb(config, image, gt_image, depth, opacity, viewpoint)
+    return get_loss_tracking_rgbd(config, image, gt_image, depth, opacity, viewpoint)
 
 
-def get_loss_tracking_rgb(config, image, depth, opacity, viewpoint):
+def get_loss_tracking_rgb(config, image, gt_image, depth, opacity, viewpoint):
     # Photometric tracking loss (monocular case, and also the RGB term of the
-    # RGB-D tracking loss). `depth` is unused.
-    gt_image = viewpoint.original_image.cuda()
-    _, h, w = gt_image.shape
+    # RGB-D tracking loss). `image`/`gt_image` are already in the loss color
+    # space (see get_loss_tracking). `depth` is unused.
+    observed = viewpoint.original_image.cuda()
+    _, h, w = observed.shape
     mask_shape = (1, h, w)
     # rgb_boundary_threshold: drop near-black GT pixels (sum of RGB below
     # threshold) — typically black borders from undistortion/rectification
-    # that carry no real scene information.
+    # that carry no real scene information. Computed on the observed image
+    # as stored, whatever the loss color space.
     rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
-    rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape)
+    rgb_pixel_mask = (observed.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape)
     # ...and additionally keep only high-gradient (edge) pixels, see
     # Camera.compute_grad_mask(): flat regions give almost no pose signal.
     rgb_pixel_mask = rgb_pixel_mask * viewpoint.grad_mask
@@ -125,9 +180,7 @@ def get_loss_tracking_rgb(config, image, depth, opacity, viewpoint):
     return l1.mean()
 
 
-def get_loss_tracking_rgbd(
-    config, image, depth, opacity, viewpoint, initialization=False
-):
+def get_loss_tracking_rgbd(config, image, gt_image, depth, opacity, viewpoint):
     # RGB-D tracking loss = alpha * photometric + (1 - alpha) * depth L1.
     # alpha (config Training.alpha, default 0.95) balances the two terms;
     # TUM RGB-D configs set 0.9 to lean more on depth.
@@ -143,15 +196,17 @@ def get_loss_tracking_rgbd(
     depth_pixel_mask = (gt_depth > 0.01).view(*depth.shape)
     opacity_mask = (opacity > 0.95).view(*depth.shape)
 
-    l1_rgb = get_loss_tracking_rgb(config, image, depth, opacity, viewpoint)
+    l1_rgb = get_loss_tracking_rgb(config, image, gt_image, depth, opacity, viewpoint)
     depth_mask = depth_pixel_mask * opacity_mask
     l1_depth = torch.abs(depth * depth_mask - gt_depth * depth_mask)
     return alpha * l1_rgb + (1 - alpha) * l1_depth.mean()
 
 
-def get_loss_mapping(config, image, depth, viewpoint, opacity, initialization=False):
+def get_loss_mapping(config, render_pkg, viewpoint, initialization=False):
     # Entry point for the MAPPING loss (BackEnd.initialize_map / map()).
-    # Here gradients flow into the Gaussians AND into keyframe poses/exposure.
+    # Here gradients flow into the Gaussians AND into keyframe poses
+    # (+ exposure if LightTracking.exposure_affine). Same color space and
+    # same exposure convention as the tracking loss.
     #
     # initialization=True (BackEnd.initialize_map, first keyframe only): skip
     # the exposure correction. Numerically this is a no-op — exposure_a/b are
@@ -160,46 +215,48 @@ def get_loss_mapping(config, image, depth, viewpoint, opacity, initialization=Fa
     # What actually makes frame 0 the exposure reference is BackEnd skipping
     # it (`current_window[cam_idx] == 0`) when building keyframe_optimizers,
     # so its exposure stays at identity forever.
-    if initialization:
-        image_ab = image
-    else:
-        image_ab = (torch.exp(viewpoint.exposure_a)) * image + viewpoint.exposure_b
+    image, gt_image = get_loss_images(config, render_pkg, viewpoint)
+    if not initialization:
+        image = apply_exposure_affine(config, image, viewpoint)
+    depth = render_pkg["depth"]
     if config["Training"]["monocular"]:
-        return get_loss_mapping_rgb(config, image_ab, depth, viewpoint)
-    return get_loss_mapping_rgbd(config, image_ab, depth, viewpoint)
+        return get_loss_mapping_rgb(config, image, gt_image, depth, viewpoint)
+    return get_loss_mapping_rgbd(config, image, gt_image, depth, viewpoint)
 
 
-def get_loss_mapping_rgb(config, image, depth, viewpoint):
+def get_loss_mapping_rgb(config, image, gt_image, depth, viewpoint):
     # Photometric mapping loss (monocular). Differences vs. the tracking
     # version: NO edge (grad_mask) restriction and NO opacity weighting —
     # mapping must reconstruct every pixel, including flat regions and
     # not-yet-covered areas (that's precisely where new Gaussians need
-    # gradients to grow/move into). `depth` is unused.
-    gt_image = viewpoint.original_image.cuda()
-    _, h, w = gt_image.shape
+    # gradients to grow/move into). `image`/`gt_image` are in the loss color
+    # space, the mask is computed on the observed image as stored. `depth` is
+    # unused.
+    observed = viewpoint.original_image.cuda()
+    _, h, w = observed.shape
     mask_shape = (1, h, w)
     rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
 
-    rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape)
+    rgb_pixel_mask = (observed.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape)
     l1_rgb = torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
 
     return l1_rgb.mean()
 
 
-def get_loss_mapping_rgbd(config, image, depth, viewpoint, initialization=False):
+def get_loss_mapping_rgbd(config, image, gt_image, depth, viewpoint):
     # RGB-D mapping loss = alpha * photometric + (1 - alpha) * depth L1.
     # Same idea as get_loss_mapping_rgb: no opacity mask on the depth term
     # (unlike tracking), because holes in the map are exactly what mapping
-    # should fill using the sensor depth. `initialization` is unused.
+    # should fill using the sensor depth.
     alpha = config["Training"]["alpha"] if "alpha" in config["Training"] else 0.95
     rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
 
-    gt_image = viewpoint.original_image.cuda()
+    observed = viewpoint.original_image.cuda()
 
     gt_depth = torch.from_numpy(viewpoint.depth).to(
         dtype=torch.float32, device=image.device
     )[None]
-    rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*depth.shape)
+    rgb_pixel_mask = (observed.sum(dim=0) > rgb_boundary_threshold).view(*depth.shape)
     depth_pixel_mask = (gt_depth > 0.01).view(*depth.shape)
 
     l1_rgb = torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)

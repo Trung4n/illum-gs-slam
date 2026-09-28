@@ -8,10 +8,12 @@ from tqdm import tqdm
 from gaussian_splatting.gaussian_renderer import render
 from gaussian_splatting.scene.gaussian_model import GaussianModel
 from gaussian_splatting.utils.loss_utils import l1_loss, ssim
+from light_models.albedo_init import get_albedo_init
+from light_models.diagnostics import log_albedo_stats
 from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
-from utils.slam_utils import get_loss_mapping
+from utils.slam_utils import get_loss_images, get_loss_mapping
 
 class BackEnd(mp.Process):
     """Mapping half of the SLAM system (runs in its own process).
@@ -39,6 +41,9 @@ class BackEnd(mp.Process):
         self.pipeline_params = None
         self.opt_params = None  # 3DGS optimizer/densification hyperparameters
         self.background = None
+        # self.shader is also set from slam.py, deliberately NOT initialized
+        # here: None means "original MonoGS", so a forgotten assignment must
+        # raise AttributeError instead of silently disabling the light model.
         # Rough scene radius (6.0, hard-coded in slam.py); scales the
         # densify/prune distance thresholds in set_hyperparams().
         self.cameras_extent = None
@@ -128,9 +133,60 @@ class BackEnd(mp.Process):
         # tags them with kf_id=frame_idx (GaussianModel.unique_kfIDs, used by
         # the "slam" pruning below). `scale` only matters when no depth_map
         # is given, which never happens here.
+        #
+        # With a light model, the new Gaussians' albedo comes from the
+        # Light.init_albedo strategy (light_models/albedo_init.py), computed
+        # BEFORE they are added so render_keyframe sees the map as it was.
+        # Resolved here rather than stored in set_hyperparams: set_hyperparams
+        # runs before this object is pickled into its own process, and the
+        # resolved strategy is a closure, which does not pickle.
+        albedo_map = None
+        if self.shader is not None:
+            init_albedo = get_albedo_init(self.config)
+
+            def render_keyframe():
+                if self.gaussians.get_xyz.shape[0] == 0:
+                    return None
+                with torch.no_grad():
+                    return render(
+                        viewpoint,
+                        self.gaussians,
+                        self.pipeline_params,
+                        self.background,
+                        shader=self.shader,
+                    )
+
+            albedo_map = init_albedo(
+                self.config,
+                viewpoint,
+                depth_map,
+                shader=self.shader,
+                render_keyframe=render_keyframe,
+            )
         self.gaussians.extend_from_pcd_seq(
-            viewpoint, kf_id=frame_idx, init=init, scale=scale, depthmap=depth_map
+            viewpoint,
+            kf_id=frame_idx,
+            init=init,
+            scale=scale,
+            depthmap=depth_map,
+            albedo_map=albedo_map,
         )
+        if self.shader is not None:
+            new = (self.gaussians.unique_kfIDs == frame_idx).to(
+                self.gaussians.get_xyz.device
+            )
+            self.log_albedo(frame_idx, "new", new)
+
+    def log_albedo(self, frame_idx, stage, mask=None):
+        # Albedo > 1 diagnostics (light_models/diagnostics.py), light model
+        # runs only. mask: optional (N,) bool selecting the Gaussians to count.
+        with torch.no_grad():
+            albedo = self.gaussians.get_albedo
+            if mask is not None:
+                albedo = albedo[mask]
+            log_albedo_stats(
+                self.config["Results"]["save_dir"], frame_idx, stage, albedo
+            )
 
     def reset(self):
         # Wipes the backend state before (re)initialization: all keyframes,
@@ -156,7 +212,11 @@ class BackEnd(mp.Process):
         for mapping_iteration in range(self.init_itr_num):
             self.iteration_count += 1
             render_pkg = render(
-                viewpoint, self.gaussians, self.pipeline_params, self.background
+                viewpoint,
+                self.gaussians,
+                self.pipeline_params,
+                self.background,
+                shader=self.shader,
             )
             (
                 image,
@@ -176,7 +236,7 @@ class BackEnd(mp.Process):
                 render_pkg["n_touched"],
             )
             loss_init = get_loss_mapping(
-                self.config, image, depth, viewpoint, opacity, initialization=True
+                self.config, render_pkg, viewpoint, initialization=True
             )
             loss_init.backward()
 
@@ -267,7 +327,11 @@ class BackEnd(mp.Process):
                 viewpoint = viewpoint_stack[cam_idx]
                 keyframes_opt.append(viewpoint)
                 render_pkg = render(
-                    viewpoint, self.gaussians, self.pipeline_params, self.background
+                    viewpoint,
+                    self.gaussians,
+                    self.pipeline_params,
+                    self.background,
+                    shader=self.shader,
                 )
                 (
                     image,
@@ -287,9 +351,7 @@ class BackEnd(mp.Process):
                     render_pkg["n_touched"],
                 )
 
-                loss_mapping += get_loss_mapping(
-                    self.config, image, depth, viewpoint, opacity
-                )
+                loss_mapping += get_loss_mapping(self.config, render_pkg, viewpoint)
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
                 visibility_filter_acm.append(visibility_filter)
                 radii_acm.append(radii)
@@ -300,7 +362,11 @@ class BackEnd(mp.Process):
             for cam_idx in torch.randperm(len(random_viewpoint_stack))[:2]:
                 viewpoint = random_viewpoint_stack[cam_idx]
                 render_pkg = render(
-                    viewpoint, self.gaussians, self.pipeline_params, self.background
+                    viewpoint,
+                    self.gaussians,
+                    self.pipeline_params,
+                    self.background,
+                    shader=self.shader,
                 )
                 (
                     image,
@@ -319,9 +385,7 @@ class BackEnd(mp.Process):
                     render_pkg["opacity"],
                     render_pkg["n_touched"],
                 )
-                loss_mapping += get_loss_mapping(
-                    self.config, image, depth, viewpoint, opacity
-                )
+                loss_mapping += get_loss_mapping(self.config, render_pkg, viewpoint)
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
                 visibility_filter_acm.append(visibility_filter)
                 radii_acm.append(radii)
@@ -461,7 +525,8 @@ class BackEnd(mp.Process):
         # slam.py between the "before" and "after" rendering metrics): 26000
         # iterations of standard 3DGS training (L1 + D-SSIM with weight
         # lambda_dssim) on one random keyframe at a time. Only the Gaussians
-        # are optimized: poses are fixed, no exposure correction, no
+        # are optimized: poses are fixed, no exposure correction (whatever
+        # LightTracking.exposure_affine says), no
         # densification (max_radii2D is updated but unused). The xyz learning
         # rate schedule restarts from iteration 1.
         Log("Starting color refinement")
@@ -475,15 +540,20 @@ class BackEnd(mp.Process):
             )
             viewpoint_cam = self.viewpoints[viewpoint_cam_idx]
             render_pkg = render(
-                viewpoint_cam, self.gaussians, self.pipeline_params, self.background
+                viewpoint_cam,
+                self.gaussians,
+                self.pipeline_params,
+                self.background,
+                shader=self.shader,
             )
-            image, visibility_filter, radii = (
-                render_pkg["render"],
+            visibility_filter, radii = (
                 render_pkg["visibility_filter"],
                 render_pkg["radii"],
             )
 
-            gt_image = viewpoint_cam.original_image.cuda()
+            # L1 + D-SSIM in LightTracking.loss_color_space, like the SLAM
+            # losses. Still no exposure affine here, as in the baseline.
+            image, gt_image = get_loss_images(self.config, render_pkg, viewpoint_cam)
             Ll1 = l1_loss(image, gt_image)
             loss = (1.0 - self.opt_params.lambda_dssim) * (
                 Ll1
@@ -568,6 +638,8 @@ class BackEnd(mp.Process):
                         cur_frame_idx, viewpoint, depth_map=depth_map, init=True
                     )
                     self.initialize_map(cur_frame_idx, viewpoint)
+                    if self.shader is not None:
+                        self.log_albedo(cur_frame_idx, "map")
                     self.push_to_frontend("init")
 
                 elif data[0] == "keyframe":
@@ -658,6 +730,8 @@ class BackEnd(mp.Process):
 
                     self.map(self.current_window, iters=iter_per_kf)
                     self.map(self.current_window, prune=True)
+                    if self.shader is not None:
+                        self.log_albedo(cur_frame_idx, "map")
                     self.push_to_frontend("keyframe")
                 else:
                     raise Exception("Unprocessed data", data)

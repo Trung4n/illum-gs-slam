@@ -13,6 +13,8 @@ import wandb
 from gaussian_splatting.scene.gaussian_model import GaussianModel
 from gaussian_splatting.utils.system_utils import mkdir_p
 from gui import gui_utils, slam_gui
+from light_models import build_shader, read_light_tracking
+from light_models.albedo_init import get_albedo_init
 from utils.config_utils import load_config
 from utils.dataset import load_dataset
 from utils.eval_utils import eval_ate, eval_rendering, save_gaussians
@@ -44,6 +46,17 @@ class SLAM:
         # This flag changes both the tracking/mapping loss and the keyframe/init logic.
         self.monocular = self.config["Dataset"]["sensor_type"] == "monocular"
         self.use_spherical_harmonics = self.config["Training"]["spherical_harmonics"]
+        # None = original MonoGS (Light.enabled: false); otherwise the light
+        # model applied by render() on top of the rasterized albedo.
+        # Built before loading the dataset so config errors fail fast.
+        self.shader = build_shader(self.config)
+        # Parsed here only to fail fast on a bad LightTracking block; the
+        # losses re-read it from the config (utils/slam_utils.py).
+        read_light_tracking(self.config)
+        if self.shader is not None:
+            # Same fail-fast for the albedo init strategy (resolved again
+            # by the backend for each keyframe, see BackEnd.add_next_kf).
+            get_albedo_init(self.config)
         self.use_gui = self.config["Results"]["use_gui"]
         if self.live_mode:
             # live demo always needs the viewer to monitor tracking quality
@@ -62,7 +75,22 @@ class SLAM:
         self.dataset = load_dataset(model_params, model_params.source_path, config=config)
 
         self.gaussians.training_setup(opt_params)
-        bg_color = [0, 0, 0]  # black background used during rasterization
+        # Rasterizer background color, read strictly from the config (no
+        # default, see docs/DECISIONS.md D9). Baseline configs set [0, 0, 0].
+        if "background" not in config["pipeline_params"]:
+            raise KeyError("Missing required config key 'pipeline_params.background'")
+        bg_color = config["pipeline_params"]["background"]
+        if (
+            not isinstance(bg_color, (list, tuple))
+            or len(bg_color) != 3
+            or not all(
+                isinstance(c, (int, float)) and not isinstance(c, bool)
+                for c in bg_color
+            )
+        ):
+            raise ValueError(
+                f"pipeline_params.background must be 3 numbers (RGB), got {bg_color!r}"
+            )
         self.background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
         # Inter-process message queues: frontend <-> backend.
@@ -95,6 +123,7 @@ class SLAM:
         self.frontend.dataset = self.dataset
         self.frontend.background = self.background
         self.frontend.pipeline_params = self.pipeline_params
+        self.frontend.shader = self.shader
         self.frontend.frontend_queue = frontend_queue
         self.frontend.backend_queue = backend_queue
         self.frontend.q_main2vis = q_main2vis
@@ -107,6 +136,7 @@ class SLAM:
         # thresholds (init_gaussian_extent, gaussian_extent) in set_hyperparams().
         self.backend.cameras_extent = 6.0
         self.backend.pipeline_params = self.pipeline_params
+        self.backend.shader = self.shader
         self.backend.opt_params = self.opt_params
         self.backend.frontend_queue = frontend_queue
         self.backend.backend_queue = backend_queue
@@ -122,6 +152,7 @@ class SLAM:
             gaussians=self.gaussians,
             q_main2vis=q_main2vis,
             q_vis2main=q_vis2main,
+            shader=self.shader,
         )
 
     def run(self):
@@ -179,6 +210,7 @@ class SLAM:
                 self.background,
                 kf_indices=kf_indices,
                 iteration="before_opt",
+                shader=self.shader,
             )
             columns = ["tag", "psnr", "ssim", "lpips", "RMSE ATE", "FPS"]
             metrics_table = wandb.Table(columns=columns)
@@ -216,6 +248,7 @@ class SLAM:
                 self.background,
                 kf_indices=kf_indices,
                 iteration="after_opt",
+                shader=self.shader,
             )
             metrics_table.add_data(
                 "After",

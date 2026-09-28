@@ -27,7 +27,7 @@ from gaussian_splatting.utils.general_utils import (
     strip_symmetric,
 )
 from gaussian_splatting.utils.graphics_utils import BasicPointCloud, getWorld2View2
-from gaussian_splatting.utils.sh_utils import RGB2SH
+from gaussian_splatting.utils.sh_utils import RGB2SH, SH2RGB
 from gaussian_splatting.utils.system_utils import mkdir_p
 
 
@@ -153,6 +153,14 @@ class GaussianModel:
         return torch.cat((features_dc, features_rest), dim=1)
 
     @property
+    def get_albedo(self):
+        # (N,3) the color the rasterizer actually splats at SH degree 0:
+        # max(C0 * dc + 0.5, 0) (forward.cu, computeColorFromSH). With a light
+        # model this is the LINEAR albedo (docs/DECISIONS.md D1), deliberately
+        # not clamped above 1.
+        return torch.clamp_min(SH2RGB(self._features_dc[:, 0, :]), 0.0)
+
+    @property
     def get_opacity(self):
         # (N,1) opacity in (0,1).
         return self.opacity_activation(self._opacity)
@@ -170,13 +178,20 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def create_pcd_from_image(self, cam_info, init=False, scale=2.0, depthmap=None):
+    def create_pcd_from_image(
+        self, cam_info, init=False, scale=2.0, depthmap=None, *, albedo_map
+    ):
         # Builds the parameters of the new Gaussians for one keyframe (it does
         # NOT add them to the map, see extend_from_pcd_seq).
         #
-        # Colors come from the keyframe's GT image after its exposure
-        # correction, so new Gaussians have colors in the same reference
-        # exposure as the rest of the map.
+        # albedo_map: None (original MonoGS) -> colors come from the
+        # keyframe's GT image after its exposure correction, so new Gaussians
+        # have colors in the same reference exposure as the rest of the map.
+        # Otherwise a (3,H,W) LINEAR albedo map from
+        # light_models/albedo_init.py; each new Gaussian takes the value at
+        # its own pixel (see create_pcd_from_image_and_depth). The 8-bit
+        # image below is then only a carrier for Open3D's back-projection.
+        # Required keyword on purpose (docs/DECISIONS.md D10).
         cam = cam_info
         image_ab = (torch.exp(cam.exposure_a)) * cam.original_image + cam.exposure_b
         image_ab = torch.clamp(image_ab, 0.0, 1.0)
@@ -206,9 +221,11 @@ class GaussianModel:
             rgb = o3d.geometry.Image(rgb_raw.astype(np.uint8))
             depth = o3d.geometry.Image(depth_raw.astype(np.float32))
 
-        return self.create_pcd_from_image_and_depth(cam, rgb, depth, init)
+        return self.create_pcd_from_image_and_depth(
+            cam, rgb, depth, init, albedo_map=albedo_map
+        )
 
-    def create_pcd_from_image_and_depth(self, cam, rgb, depth, init=False):
+    def create_pcd_from_image_and_depth(self, cam, rgb, depth, init=False, *, albedo_map):
         # Back-projects an RGB-D pair into a world-space point cloud and turns
         # each point into an initial Gaussian. Returns
         # (xyz, features, scales, rots, opacities), all pre-activation.
@@ -259,6 +276,12 @@ class GaussianModel:
         pcd_tmp = pcd_tmp.random_down_sample(1.0 / downsample_factor)
         new_xyz = np.asarray(pcd_tmp.points)
         new_rgb = np.asarray(pcd_tmp.colors)
+        if albedo_map is not None:
+            # Light model: replace the 8-bit sRGB colors by the float linear
+            # albedo of each point's own pixel. Open3D's random_down_sample
+            # does not report which pixels it kept, so each point is
+            # projected back with the same pose and intrinsics.
+            new_rgb = self._sample_map_at_points(albedo_map, new_xyz, cam, W2C)
 
         pcd = BasicPointCloud(
             points=new_xyz, colors=new_rgb, normals=np.zeros((new_xyz.shape[0], 3))
@@ -304,6 +327,36 @@ class GaussianModel:
 
         return fused_point_cloud, features, scales, rots, opacities
 
+    @staticmethod
+    def _sample_map_at_points(image_map, points_world, cam, W2C):
+        # Value of a (C,H,W) map at the pixel each world point was
+        # back-projected from by Open3D in create_pcd_from_image_and_depth.
+        # Open3D uses x = (u - cx) * z / fx with u the integer column (same
+        # for v), so projecting with the SAME W2C and intrinsics returns
+        # integer pixel coordinates up to float round-off.
+        pts = np.asarray(points_world, dtype=np.float64)
+        W2C = np.asarray(W2C, dtype=np.float64)
+        p_cam = pts @ W2C[:3, :3].T + W2C[:3, 3]
+        u = cam.fx * p_cam[:, 0] / p_cam[:, 2] + cam.cx
+        v = cam.fy * p_cam[:, 1] / p_cam[:, 2] + cam.cy
+        u_px, v_px = np.rint(u), np.rint(v)
+        # Consistency check, not a tunable threshold: round-off is ~1e-9 px,
+        # while a wrong pixel convention (e.g. a half-pixel shift) would show
+        # up as 0.5 px. A quarter pixel separates the two cases.
+        off = max(np.abs(u - u_px).max(initial=0.0), np.abs(v - v_px).max(initial=0.0))
+        if off > 0.25:
+            raise RuntimeError(
+                f"Projected points are {off:.3f} px off the pixel grid: pixel "
+                "convention differs from Open3D's back-projection"
+            )
+        u_px, v_px = u_px.astype(np.int64), v_px.astype(np.int64)
+        _, h, w = image_map.shape
+        if (u_px.min(initial=0) < 0 or v_px.min(initial=0) < 0
+                or u_px.max(initial=0) >= w or v_px.max(initial=0) >= h):
+            raise RuntimeError("Projected points fall outside the image")
+        values = image_map.detach().cpu().double().numpy()
+        return values[:, v_px, u_px].T  # (N, C)
+
     def init_lr(self, spatial_lr_scale):
         # spatial_lr_scale: multiplies the xyz and scaling learning rates, so
         # they are relative to scene size. slam.py sets it to 6.0 (fixed).
@@ -339,12 +392,15 @@ class GaussianModel:
         )
 
     def extend_from_pcd_seq(
-        self, cam_info, kf_id=-1, init=False, scale=2.0, depthmap=None
+        self, cam_info, kf_id=-1, init=False, scale=2.0, depthmap=None, *, albedo_map
     ):
         # Entry point used by the backend (BackEnd.add_next_kf): create the
-        # Gaussians for one keyframe, then add them to the map.
+        # Gaussians for one keyframe, then add them to the map. albedo_map:
+        # see create_pcd_from_image (None = original MonoGS colors).
         fused_point_cloud, features, scales, rots, opacities = (
-            self.create_pcd_from_image(cam_info, init, scale=scale, depthmap=depthmap)
+            self.create_pcd_from_image(
+                cam_info, init, scale=scale, depthmap=depthmap, albedo_map=albedo_map
+            )
         )
         self.extend_from_pcd(
             fused_point_cloud, features, scales, rots, opacities, kf_id

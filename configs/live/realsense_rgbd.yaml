@@ -78,3 +78,18 @@ model_params:
 pipeline_params:
   convert_SHs_python: False
   compute_cov3D_python: False
+  # Rasterizer background color (RGB). Required, no default. Black = pixels
+  # not covered by any Gaussian receive no light (docs/DECISIONS.md D9).
+  background: [0, 0, 0]
+
+# Co-located light model (light_models/). false = original MonoGS.
+# Required key: there is no default (CLAUDE.md section 2).
+Light:
+  enabled: False
+
+# Loss options of the light extension, used by tracking AND mapping
+# (docs/DECISIONS.md D2, D3). Required, no default. These two values
+# reproduce original MonoGS.
+LightTracking:
+  loss_color_space: srgb   # srgb | linear (linear needs Light.enabled)
+  exposure_affine: True    # exp(a)*I + b on the prediction, in the loss space

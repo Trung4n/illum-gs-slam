@@ -19,6 +19,7 @@ from diff_gaussian_rasterization import (
 
 from gaussian_splatting.scene.gaussian_model import GaussianModel
 from gaussian_splatting.utils.sh_utils import eval_sh
+from utils.color_space import linear2sRGB
 
 # This is the single "forward pass" of the whole SLAM system: both
 # FrontEnd.tracking() (pose-only optimization) and BackEnd.map()/
@@ -40,6 +41,8 @@ def render(
     scaling_modifier=1.0,
     override_color=None,
     mask=None,
+    *,
+    shader,
 ):
     """
     Render the scene.
@@ -70,6 +73,19 @@ def render(
             yet the return dict below unconditionally includes "n_touched" -
             that would raise NameError. Left here only for API parity with
             upstream 3DGS.
+        shader: REQUIRED keyword, no default on purpose: forgetting to pass
+            it must fail loudly instead of silently rendering without the
+            light model. Built once by light_models.build_shader(config).
+            - None (Light.enabled: false): original MonoGS, the rasterized
+              color IS "render" and nothing below changes.
+            - a callable shader(gbuffer, viewpoint_camera) -> (3,H,W) linear
+              radiance. gbuffer = {"albedo", "depth", "opacity"} straight
+              from the rasterizer. With the black background, albedo and
+              depth are both opacity-weighted sums (sum_i w_i x_i). The
+              shader keeps the albedo that way (correct with a black
+              background and a multiplicative ambient term) but MUST divide
+              depth by opacity before back-projecting, with the opacity
+              threshold coming from the config (see docs/DECISIONS.md).
 
     Returns:
         None if the map is still empty (no Gaussians yet), otherwise a dict
@@ -231,8 +247,8 @@ def render(
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
-    return {
-        "render": rendered_image,  # (3,H,W) rendered color image
+    render_pkg = {
+        "render": rendered_image,  # (3,H,W) rendered color image, sRGB-encoded (see below)
         "viewspace_points": screenspace_points,  # dummy tensor; .grad read for densification stats
         "visibility_filter": radii > 0,  # (N,) bool - which Gaussians actually landed on screen
         "radii": radii,  # (N,) on-screen radius per Gaussian, 0 if culled
@@ -240,3 +256,23 @@ def render(
         "opacity": opacity,  # (1,H,W) rendered accumulated-alpha map (NOT per-Gaussian opacity)
         "n_touched": n_touched,  # (N,) per-Gaussian pixel-touch count -> keyframe covisibility / pruning
     }
+
+    # Light model hook. Contract: "render" is ALWAYS sRGB-encoded, the space
+    # of the observed images, of evaluation and of the GUI, exactly as in the
+    # baseline. So eval/GUI keep reading "render" unchanged. With a shader,
+    # the rasterized color is the (opacity-weighted, linear) albedo, and the
+    # linear radiance is exposed separately for losses computed in linear
+    # space; the loss picks "render" or "radiance_linear" according to
+    # LightTracking.loss_color_space.
+    if shader is not None:
+        gbuffer = {"albedo": rendered_image, "depth": depth, "opacity": opacity}
+        radiance_linear = shader(gbuffer, viewpoint_camera)
+        if radiance_linear.shape != rendered_image.shape:
+            raise ValueError(
+                f"shader returned shape {tuple(radiance_linear.shape)}, "
+                f"expected {tuple(rendered_image.shape)}"
+            )
+        render_pkg["albedo"] = rendered_image  # (3,H,W) linear, opacity-weighted
+        render_pkg["radiance_linear"] = radiance_linear  # (3,H,W) linear
+        render_pkg["render"] = linear2sRGB(radiance_linear)
+    return render_pkg
