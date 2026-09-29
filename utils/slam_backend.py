@@ -9,7 +9,7 @@ from gaussian_splatting.gaussian_renderer import render
 from gaussian_splatting.scene.gaussian_model import GaussianModel
 from gaussian_splatting.utils.loss_utils import l1_loss, ssim
 from light_models.albedo_init import get_albedo_init
-from light_models.diagnostics import log_albedo_stats
+from light_models.diagnostics import log_albedo_stats, log_exposure
 from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
@@ -176,6 +176,7 @@ class BackEnd(mp.Process):
                 self.gaussians.get_xyz.device
             )
             self.log_albedo(frame_idx, "new", new)
+        log_exposure(self.config["Results"]["save_dir"], frame_idx, "new", viewpoint)
 
     def log_albedo(self, frame_idx, stage, mask=None):
         # Albedo > 1 diagnostics (light_models/diagnostics.py), light model
@@ -640,6 +641,9 @@ class BackEnd(mp.Process):
                     self.initialize_map(cur_frame_idx, viewpoint)
                     if self.shader is not None:
                         self.log_albedo(cur_frame_idx, "map")
+                    log_exposure(
+                        self.config["Results"]["save_dir"], cur_frame_idx, "map", viewpoint
+                    )
                     self.push_to_frontend("init")
 
                 elif data[0] == "keyframe":
@@ -732,6 +736,12 @@ class BackEnd(mp.Process):
                     self.map(self.current_window, prune=True)
                     if self.shader is not None:
                         self.log_albedo(cur_frame_idx, "map")
+                    log_exposure(
+                        self.config["Results"]["save_dir"],
+                        cur_frame_idx,
+                        "map",
+                        self.viewpoints[cur_frame_idx],
+                    )
                     self.push_to_frontend("keyframe")
                 else:
                     raise Exception("Unprocessed data", data)

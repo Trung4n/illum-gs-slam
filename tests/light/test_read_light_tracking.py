@@ -7,7 +7,8 @@ from light_models import read_light_tracking
 def _config(light_tracking=None, light_enabled=False):
     cfg = {"Light": {"enabled": light_enabled}, "Training": {"spherical_harmonics": False}}
     if light_tracking is not None:
-        cfg["LightTracking"] = light_tracking
+        # Tests about other keys get the baseline pixel_weight block.
+        cfg["LightTracking"] = {"pixel_weight": {"enabled": False}, **light_tracking}
     return cfg
 
 
@@ -60,3 +61,59 @@ def test_valid_combinations(space, affine):
 def test_baseline_values_accepted_with_light_disabled():
     s = read_light_tracking(_config({"loss_color_space": "srgb", "exposure_affine": True}))
     assert (s.loss_color_space, s.exposure_affine) == ("srgb", True)
+
+
+def _lt(pixel_weight):
+    return {"loss_color_space": "srgb", "exposure_affine": False, "pixel_weight": pixel_weight}
+
+
+def test_pixel_weight_block_required():
+    cfg = {"Light": {"enabled": True},
+           "LightTracking": {"loss_color_space": "srgb", "exposure_affine": False}}
+    with pytest.raises(KeyError, match="LightTracking.pixel_weight"):
+        read_light_tracking(cfg)
+
+
+def test_pixel_weight_disabled():
+    pw = read_light_tracking(_config(_lt({"enabled": False}))).pixel_weight
+    assert pw.enabled is False and pw.apply_to == ()
+
+
+def test_pixel_weight_enabled_requires_light():
+    block = {"enabled": True, "apply_to": ["tracking"], "min_cos_nl": 0.3}
+    with pytest.raises(ValueError, match="Light.enabled"):
+        read_light_tracking(_config(_lt(block), light_enabled=False))
+
+
+@pytest.mark.parametrize("missing", ["apply_to", "min_cos_nl"])
+def test_pixel_weight_enabled_keys_required(missing):
+    block = {"enabled": True, "apply_to": ["tracking"], "min_cos_nl": 0.3}
+    del block[missing]
+    with pytest.raises(KeyError, match=f"pixel_weight.{missing}"):
+        read_light_tracking(_config(_lt(block), light_enabled=True))
+
+
+@pytest.mark.parametrize("apply_to", [[], ["track"], ["tracking", "tracking"], "tracking"])
+def test_pixel_weight_apply_to_validated(apply_to):
+    block = {"enabled": True, "apply_to": apply_to, "min_cos_nl": 0.3}
+    with pytest.raises(ValueError, match="apply_to"):
+        read_light_tracking(_config(_lt(block), light_enabled=True))
+
+
+@pytest.mark.parametrize("value", [1.5, -2, "0.3", True])
+def test_pixel_weight_min_cos_validated(value):
+    block = {"enabled": True, "apply_to": ["mapping"], "min_cos_nl": value}
+    with pytest.raises(ValueError, match="min_cos_nl"):
+        read_light_tracking(_config(_lt(block), light_enabled=True))
+
+
+def test_pixel_weight_unknown_key_rejected():
+    block = {"enabled": False, "saturation_thr": 250}
+    with pytest.raises(ValueError, match="unexpected keys"):
+        read_light_tracking(_config(_lt(block)))
+
+
+def test_pixel_weight_enabled_parsed():
+    block = {"enabled": True, "apply_to": ["tracking", "mapping"], "min_cos_nl": 0.3}
+    pw = read_light_tracking(_config(_lt(block), light_enabled=True)).pixel_weight
+    assert (pw.enabled, pw.apply_to, pw.min_cos_nl) == (True, ("tracking", "mapping"), 0.3)

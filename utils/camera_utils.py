@@ -241,3 +241,21 @@ class Camera(nn.Module):
 
         self.exposure_a = None
         self.exposure_b = None
+
+
+def build_projection_matrix(fx, fy, cx, cy, width, height, device):
+    # The (transposed) projection matrix shared by every Camera of a run.
+    # Moved out of FrontEnd.run() unchanged so tools/verify/ builds cameras
+    # exactly like SLAM does. znear/zfar are MonoGS's original hard-coded
+    # clipping planes (not light-model values).
+    projection_matrix = getProjectionMatrix2(
+        znear=0.01,
+        zfar=100.0,
+        fx=fx,
+        fy=fy,
+        cx=cx,
+        cy=cy,
+        W=width,
+        H=height,
+    ).transpose(0, 1)
+    return projection_matrix.to(device=device)

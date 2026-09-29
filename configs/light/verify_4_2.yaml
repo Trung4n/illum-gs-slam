@@ -1,0 +1,51 @@
+# Verification of step 4.2 (tools/verify/shading_layer1.py, shading_layer2.py).
+# NOT a SLAM run. Light parameters are the Blender CONFIG values of
+# light_params.json (docs/DECISIONS.md D13), to separate code errors from
+# calibration errors; the SLAM configs use the estimated values.
+inherit_from: "configs/mono/replica/office0.yaml"
+
+Light:
+  enabled: True
+  params_file: light_params.json   # the scripts take --params-file explicitly
+  shader:
+    type: colocated
+  intensity: {source: params_file, key: intensity.K_theory, learnable: false}
+  pose:
+    t_CL: {source: params_file, key: t_CL_m.config_opencv, learnable: false}
+    R_CL: {source: params_file, key: R_CL.config, learnable: false}
+  falloff:
+    type: inverse_square
+  angular:
+    type: blender_spot
+    half_angle_deg: {source: params_file, key: cone.half_angle_deg_config, learnable: false}
+    blend: {source: params_file, key: cone.blend_config, learnable: false}
+  cosine:
+    type: lambert
+    # Layer 1 feeds ground-truth normals through the G-buffer; the script
+    # also runs a depth_fd variant on the ground-truth depth.
+    normal_source: gbuffer
+  ambient:
+    type: multiplicative_const
+    c: {source: params_file, key: ambient.c_config, learnable: false}
+  gbuffer:
+    opacity_thr: 0.95
+
+Verify:
+  layer1:
+    # Pixel selection copied from Replica/scripts/physics_check/check_physics.py
+    # (parse_cli defaults and fit_pixels), NOT imported (D16):
+    saturation_8bit: 250        # --sat: excluded if any channel >= this (8-bit)
+    dark_gray_8bit: 10          # --dark: excluded if gray (Pillow "L") <= this
+    cos_min: 0.3                # --cos-min: excluded if n.l < this
+    albedo_min_sum_linear: 0.1  # --albedo-min: excluded if sum of linear albedo < this
+    planar_deg: 5.0             # --planar-deg: excluded if pass normal and depth normal differ more
+    core_margin_deg: 0.5        # fit_pixels(need_core): core = theta < core_half_angle - margin
+    # Shadows: check_physics.py exports no shadow mask, so shadowed pixels are
+    # NOT excluded (about 0.09% of the cone); median and p95 are reported.
+  layer2:
+    # Opacity threshold on the RASTERIZED maps (new, D16).
+    opacity_thr: 0.95
+    # Opacity given to the Gaussians built from ground truth, so that the
+    # accumulated alpha can exceed opacity_thr (MonoGS creates them at 0.5).
+    gaussian_opacity: 0.99
+    # Same pixel selection as layer 1 (keys above) is reused.

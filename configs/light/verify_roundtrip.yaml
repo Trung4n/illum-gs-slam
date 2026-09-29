@@ -1,0 +1,23 @@
+# Albedo round-trip check of step 4.1 (tools/verify/albedo_roundtrip.py).
+# NOT a SLAM run: Gaussians are created from the GROUND-TRUTH albedo pass and
+# depth at the ground-truth pose, rasterized, and compared with the albedo
+# pass. Checks the color path (0.5 SH offset, sRGB->linear, opacity
+# weighting, pixel sampling) without any optimization or randomness from SLAM.
+inherit_from: "configs/mono/replica/office0.yaml"
+
+Dataset:
+  # One Gaussian per valid pixel, so the rasterized map is dense.
+  pcd_downsample_init: 1
+
+Light:
+  enabled: True
+  shader:
+    type: identity
+
+Verify:
+  roundtrip:
+    # Pixels whose accumulated opacity is below this are excluded (holes).
+    # New Gaussians start at opacity 0.5 (MonoGS init) and are about one
+    # pixel apart, so the accumulated alpha at a pixel center is only ~0.5:
+    # this threshold removes holes, it is NOT the 0.95 of layer 2 (D16).
+    opacity_thr: 0.3

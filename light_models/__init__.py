@@ -14,6 +14,7 @@
 
 from types import SimpleNamespace
 
+from light_models.params import load_params_file, params_file_path
 from light_models.shaders import make_shader
 from utils.config_utils import require_key
 
@@ -30,9 +31,14 @@ def _light_enabled(config):
     return enabled
 
 
-def build_shader(config):
+def build_shader(config, params_data=None):
     """Returns None for original MonoGS (Light.enabled: false), otherwise the
-    shader callable used by render()."""
+    shader callable used by render().
+
+    params_data: the loaded light params (dict). None = read the per-scene
+    file Light.params_file relative to Dataset.dataset_path (D17), and only
+    if the shader needs light parameters. The verification scripts pass the
+    data explicitly."""
     if not _light_enabled(config):
         return None
 
@@ -43,7 +49,12 @@ def build_shader(config):
             "Light.enabled: true requires Training.spherical_harmonics: false"
         )
 
-    return make_shader(require_key(config["Light"], "shader", "Light"))
+    def load_params():
+        if params_data is not None:
+            return params_data
+        return load_params_file(params_file_path(config))
+
+    return make_shader(config["Light"], load_params)
 
 
 # Strategies for the albedo of newly created Gaussians (docs/DECISIONS.md D7).
@@ -101,4 +112,49 @@ def read_light_tracking(config):
         raise ValueError(
             "LightTracking.loss_color_space: linear requires Light.enabled: true"
         )
-    return SimpleNamespace(loss_color_space=space, exposure_affine=affine)
+    return SimpleNamespace(
+        loss_color_space=space,
+        exposure_affine=affine,
+        pixel_weight=_read_pixel_weight(block, config),
+    )
+
+
+# Losses a pixel weight can be applied to.
+PIXEL_WEIGHT_TARGETS = ("tracking", "mapping")
+# Criteria implemented so far (step 4.2). Step 4.4 adds saturation / dark /
+# gradient / opacity thresholds here, each one required when present.
+_PIXEL_WEIGHT_KEYS = ("enabled", "apply_to", "min_cos_nl")
+
+
+def _read_pixel_weight(block, config):
+    """LightTracking.pixel_weight: {enabled: false} or
+    {enabled: true, apply_to: [tracking|mapping, ...], min_cos_nl: <number>}.
+    min_cos_nl keeps pixels whose depth_fd normal is valid and n . l >= it
+    (docs/DECISIONS.md D15); it needs cosine: lambert, which produces n . l."""
+    pw = require_key(block, "pixel_weight", "LightTracking")
+    where = "LightTracking.pixel_weight"
+    unknown = set(pw) - set(_PIXEL_WEIGHT_KEYS) if isinstance(pw, dict) else None
+    if unknown:
+        raise ValueError(f"{where}: unexpected keys {sorted(unknown)}")
+    enabled = require_key(pw, "enabled", where)
+    if not isinstance(enabled, bool):
+        raise TypeError(f"{where}.enabled must be true or false, got {enabled!r}")
+    if not enabled:
+        return SimpleNamespace(enabled=False, apply_to=(), min_cos_nl=None)
+    if not _light_enabled(config):
+        raise ValueError(f"{where}.enabled: true requires Light.enabled: true")
+    apply_to = require_key(pw, "apply_to", where)
+    if (
+        not isinstance(apply_to, list)
+        or not apply_to
+        or len(set(apply_to)) != len(apply_to)
+        or not set(apply_to) <= set(PIXEL_WEIGHT_TARGETS)
+    ):
+        raise ValueError(
+            f"{where}.apply_to must be a non-empty list of distinct values from "
+            f"{PIXEL_WEIGHT_TARGETS}, got {apply_to!r}"
+        )
+    min_cos = require_key(pw, "min_cos_nl", where)
+    if isinstance(min_cos, bool) or not isinstance(min_cos, (int, float)) or not -1 <= min_cos <= 1:
+        raise ValueError(f"{where}.min_cos_nl must be a number in [-1, 1], got {min_cos!r}")
+    return SimpleNamespace(enabled=True, apply_to=tuple(apply_to), min_cos_nl=float(min_cos))

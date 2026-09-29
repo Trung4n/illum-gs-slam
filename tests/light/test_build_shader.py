@@ -61,19 +61,24 @@ def test_enabled_requires_shader_type():
 def test_identity_shader_returns_albedo_unchanged():
     shader = build_shader(_config(light={"enabled": True, "shader": {"type": "identity"}}))
     albedo = object()
-    assert shader({"albedo": albedo, "depth": None, "opacity": None}, None) is albedo
+    out = shader({"albedo": albedo, "depth": None, "opacity": None}, None)
+    assert out == {"radiance_linear": albedo}
 
 
 def test_shader_survives_pickling():
     # Backend and GUI processes are started with "spawn".
     shader = build_shader(_config(light={"enabled": True, "shader": {"type": "identity"}}))
     clone = pickle.loads(pickle.dumps(shader))
-    assert clone({"albedo": 1}, None) == 1
+    assert clone({"albedo": 1}, None) == {"radiance_linear": 1}
 
 
-def test_planned_shader_not_implemented():
-    with pytest.raises(NotImplementedError, match="colocated"):
-        build_shader(_config(light={"enabled": True, "shader": {"type": "colocated"}}))
+def test_colocated_requires_its_components():
+    # colocated reads intensity/pose/components from the Light block.
+    with pytest.raises(KeyError, match="Light.intensity"):
+        build_shader(
+            _config(light={"enabled": True, "shader": {"type": "colocated"}}),
+            params_data={},
+        )
 
 
 @pytest.mark.parametrize("name", ["Identity", "lambert", None])
@@ -127,4 +132,5 @@ def test_every_root_config_states_baseline_explicitly(path):
     assert cfg["LightTracking"] == {
         "loss_color_space": "srgb",
         "exposure_affine": True,
+        "pixel_weight": {"enabled": False},
     }, path

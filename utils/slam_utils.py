@@ -62,6 +62,24 @@ def undo_exposure_affine(config, image, viewpoint):
     return (image - viewpoint.exposure_b) / torch.exp(viewpoint.exposure_a)
 
 
+def get_light_pixel_weight(config, render_pkg, target):
+    # (1,H,W) 0/1 weight from LightTracking.pixel_weight for `target`
+    # ("tracking" or "mapping"), or None when no weight applies (then the
+    # loss is computed exactly as before, op for op). Criterion so far:
+    # min_cos_nl, i.e. keep pixels with a valid normal and n . l >= min_cos_nl
+    # (docs/DECISIONS.md D15). n . l comes from the shader's lambert term.
+    pw = read_light_tracking(config).pixel_weight
+    if not pw.enabled or target not in pw.apply_to:
+        return None
+    if "light_cos_nl" not in render_pkg:
+        raise KeyError(
+            "LightTracking.pixel_weight.min_cos_nl needs n . l from the shader "
+            "(Light.cosine.type: lambert)"
+        )
+    keep = (render_pkg["light_cos_nl"] >= pw.min_cos_nl) & render_pkg["light_normal_valid"]
+    return keep.to(render_pkg["light_cos_nl"].dtype)
+
+
 def image_gradient(image):
     # Compute image gradient using Scharr Filter
     # Returns per-channel (vertical, horizontal) derivatives, same (C,H,W)
@@ -150,12 +168,17 @@ def get_loss_tracking(config, render_pkg, viewpoint):
     image, gt_image = get_loss_images(config, render_pkg, viewpoint)
     image = apply_exposure_affine(config, image, viewpoint)
     depth, opacity = render_pkg["depth"], render_pkg["opacity"]
+    weight = get_light_pixel_weight(config, render_pkg, "tracking")
     if config["Training"]["monocular"]:
-        return get_loss_tracking_rgb(config, image, gt_image, depth, opacity, viewpoint)
-    return get_loss_tracking_rgbd(config, image, gt_image, depth, opacity, viewpoint)
+        return get_loss_tracking_rgb(
+            config, image, gt_image, depth, opacity, viewpoint, weight
+        )
+    return get_loss_tracking_rgbd(
+        config, image, gt_image, depth, opacity, viewpoint, weight
+    )
 
 
-def get_loss_tracking_rgb(config, image, gt_image, depth, opacity, viewpoint):
+def get_loss_tracking_rgb(config, image, gt_image, depth, opacity, viewpoint, pixel_weight):
     # Photometric tracking loss (monocular case, and also the RGB term of the
     # RGB-D tracking loss). `image`/`gt_image` are already in the loss color
     # space (see get_loss_tracking). `depth` is unused.
@@ -171,6 +194,9 @@ def get_loss_tracking_rgb(config, image, gt_image, depth, opacity, viewpoint):
     # ...and additionally keep only high-gradient (edge) pixels, see
     # Camera.compute_grad_mask(): flat regions give almost no pose signal.
     rgb_pixel_mask = rgb_pixel_mask * viewpoint.grad_mask
+    # Light-model pixel weight (get_light_pixel_weight); None = baseline.
+    if pixel_weight is not None:
+        rgb_pixel_mask = rgb_pixel_mask * pixel_weight
     # Weighting by rendered `opacity` (per-pixel accumulated alpha) makes the
     # loss ignore pixels the map doesn't cover yet: there the rendering is
     # just background, and matching it would drag the pose toward nonsense.
@@ -180,7 +206,7 @@ def get_loss_tracking_rgb(config, image, gt_image, depth, opacity, viewpoint):
     return l1.mean()
 
 
-def get_loss_tracking_rgbd(config, image, gt_image, depth, opacity, viewpoint):
+def get_loss_tracking_rgbd(config, image, gt_image, depth, opacity, viewpoint, pixel_weight):
     # RGB-D tracking loss = alpha * photometric + (1 - alpha) * depth L1.
     # alpha (config Training.alpha, default 0.95) balances the two terms;
     # TUM RGB-D configs set 0.9 to lean more on depth.
@@ -196,7 +222,9 @@ def get_loss_tracking_rgbd(config, image, gt_image, depth, opacity, viewpoint):
     depth_pixel_mask = (gt_depth > 0.01).view(*depth.shape)
     opacity_mask = (opacity > 0.95).view(*depth.shape)
 
-    l1_rgb = get_loss_tracking_rgb(config, image, gt_image, depth, opacity, viewpoint)
+    l1_rgb = get_loss_tracking_rgb(
+        config, image, gt_image, depth, opacity, viewpoint, pixel_weight
+    )
     depth_mask = depth_pixel_mask * opacity_mask
     l1_depth = torch.abs(depth * depth_mask - gt_depth * depth_mask)
     return alpha * l1_rgb + (1 - alpha) * l1_depth.mean()
@@ -219,12 +247,13 @@ def get_loss_mapping(config, render_pkg, viewpoint, initialization=False):
     if not initialization:
         image = apply_exposure_affine(config, image, viewpoint)
     depth = render_pkg["depth"]
+    weight = get_light_pixel_weight(config, render_pkg, "mapping")
     if config["Training"]["monocular"]:
-        return get_loss_mapping_rgb(config, image, gt_image, depth, viewpoint)
-    return get_loss_mapping_rgbd(config, image, gt_image, depth, viewpoint)
+        return get_loss_mapping_rgb(config, image, gt_image, depth, viewpoint, weight)
+    return get_loss_mapping_rgbd(config, image, gt_image, depth, viewpoint, weight)
 
 
-def get_loss_mapping_rgb(config, image, gt_image, depth, viewpoint):
+def get_loss_mapping_rgb(config, image, gt_image, depth, viewpoint, pixel_weight):
     # Photometric mapping loss (monocular). Differences vs. the tracking
     # version: NO edge (grad_mask) restriction and NO opacity weighting —
     # mapping must reconstruct every pixel, including flat regions and
@@ -238,12 +267,14 @@ def get_loss_mapping_rgb(config, image, gt_image, depth, viewpoint):
     rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
 
     rgb_pixel_mask = (observed.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape)
+    if pixel_weight is not None:
+        rgb_pixel_mask = rgb_pixel_mask * pixel_weight
     l1_rgb = torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
 
     return l1_rgb.mean()
 
 
-def get_loss_mapping_rgbd(config, image, gt_image, depth, viewpoint):
+def get_loss_mapping_rgbd(config, image, gt_image, depth, viewpoint, pixel_weight):
     # RGB-D mapping loss = alpha * photometric + (1 - alpha) * depth L1.
     # Same idea as get_loss_mapping_rgb: no opacity mask on the depth term
     # (unlike tracking), because holes in the map are exactly what mapping
@@ -257,6 +288,8 @@ def get_loss_mapping_rgbd(config, image, gt_image, depth, viewpoint):
         dtype=torch.float32, device=image.device
     )[None]
     rgb_pixel_mask = (observed.sum(dim=0) > rgb_boundary_threshold).view(*depth.shape)
+    if pixel_weight is not None:
+        rgb_pixel_mask = rgb_pixel_mask * pixel_weight
     depth_pixel_mask = (gt_depth > 0.01).view(*depth.shape)
 
     l1_rgb = torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)

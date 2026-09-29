@@ -28,7 +28,11 @@ def _config(space="srgb", affine=True, light_enabled=None):
         light_enabled = space == "linear"
     return {
         "Light": {"enabled": light_enabled},
-        "LightTracking": {"loss_color_space": space, "exposure_affine": affine},
+        "LightTracking": {
+            "loss_color_space": space,
+            "exposure_affine": affine,
+            "pixel_weight": {"enabled": False},
+        },
         "Training": {"monocular": True, "rgb_boundary_threshold": RGB_BOUNDARY},
     }
 

@@ -5,9 +5,9 @@ import torch
 import torch.multiprocessing as mp
 
 from gaussian_splatting.gaussian_renderer import render
-from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2, getWorld2View2
+from gaussian_splatting.utils.graphics_utils import getWorld2View2
 from gui import gui_utils
-from utils.camera_utils import Camera
+from utils.camera_utils import Camera, build_projection_matrix
 from utils.eval_utils import eval_ate, save_gaussians
 from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
@@ -485,17 +485,15 @@ class FrontEnd(mp.Process):
         # Returns when the dataset is exhausted.
         cur_frame_idx = 0
         # Same intrinsics for every frame: built once, shared by all Cameras.
-        projection_matrix = getProjectionMatrix2(
-            znear=0.01,
-            zfar=100.0,
-            fx=self.dataset.fx,
-            fy=self.dataset.fy,
-            cx=self.dataset.cx,
-            cy=self.dataset.cy,
-            W=self.dataset.width,
-            H=self.dataset.height,
-        ).transpose(0, 1)
-        projection_matrix = projection_matrix.to(device=self.device)
+        projection_matrix = build_projection_matrix(
+            self.dataset.fx,
+            self.dataset.fy,
+            self.dataset.cx,
+            self.dataset.cy,
+            self.dataset.width,
+            self.dataset.height,
+            self.device,
+        )
         # Per-frame timing, used only for the 3 fps throttle below.
         tic = torch.cuda.Event(enable_timing=True)
         toc = torch.cuda.Event(enable_timing=True)

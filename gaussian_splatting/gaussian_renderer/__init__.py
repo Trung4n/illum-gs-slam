@@ -78,8 +78,10 @@ def render(
             light model. Built once by light_models.build_shader(config).
             - None (Light.enabled: false): original MonoGS, the rasterized
               color IS "render" and nothing below changes.
-            - a callable shader(gbuffer, viewpoint_camera) -> (3,H,W) linear
-              radiance. gbuffer = {"albedo", "depth", "opacity"} straight
+            - a callable shader(gbuffer, viewpoint_camera) -> dict with
+              "radiance_linear" (3,H,W) and optional auxiliary per-pixel maps
+              (copied into the returned dict, see light_models/shaders.py).
+              gbuffer = {"albedo", "depth", "opacity"} straight
               from the rasterizer. With the black background, albedo and
               depth are both opacity-weighted sums (sum_i w_i x_i). The
               shader keeps the albedo that way (correct with a black
@@ -266,13 +268,17 @@ def render(
     # LightTracking.loss_color_space.
     if shader is not None:
         gbuffer = {"albedo": rendered_image, "depth": depth, "opacity": opacity}
-        radiance_linear = shader(gbuffer, viewpoint_camera)
+        shaded = shader(gbuffer, viewpoint_camera)
+        radiance_linear = shaded["radiance_linear"]
         if radiance_linear.shape != rendered_image.shape:
             raise ValueError(
                 f"shader returned shape {tuple(radiance_linear.shape)}, "
                 f"expected {tuple(rendered_image.shape)}"
             )
+        clash = (set(shaded) - {"radiance_linear"}) & (set(render_pkg) | {"albedo"})
+        if clash:
+            raise ValueError(f"shader output keys {sorted(clash)} clash with render_pkg")
+        render_pkg.update(shaded)  # radiance_linear (3,H,W) linear + aux maps
         render_pkg["albedo"] = rendered_image  # (3,H,W) linear, opacity-weighted
-        render_pkg["radiance_linear"] = radiance_linear  # (3,H,W) linear
         render_pkg["render"] = linear2sRGB(radiance_linear)
     return render_pkg

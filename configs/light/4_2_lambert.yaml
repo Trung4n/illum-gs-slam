@@ -1,0 +1,19 @@
+# Step 4.2: as 4_2_nocos.yaml plus the Lambert term, with normals from finite
+# differences of the rasterized depth divided by opacity (depth_fd, D15), and
+# a pixel weight dropping pixels whose normal is invalid or n.l too small.
+inherit_from: "configs/light/4_2_nocos.yaml"
+
+Light:
+  cosine:
+    type: lambert
+    normal_source: depth_fd
+
+LightTracking:
+  pixel_weight:
+    enabled: True
+    # depth_fd normals are unreliable at depth edges in mapping too, hence
+    # both losses. Confirmed 2026-09-29 (D26).
+    apply_to: [tracking, mapping]
+    # Starting value = check_physics.py --cos-min (the n.l below which the
+    # physics check did not trust a pixel). Confirmed 2026-09-29 (D26).
+    min_cos_nl: 0.3

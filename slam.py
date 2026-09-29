@@ -1,4 +1,5 @@
 import os
+import shutil
 import sys
 import time
 from argparse import ArgumentParser
@@ -15,6 +16,7 @@ from gaussian_splatting.utils.system_utils import mkdir_p
 from gui import gui_utils, slam_gui
 from light_models import build_shader, read_light_tracking
 from light_models.albedo_init import get_albedo_init
+from light_models.params import params_file_path
 from utils.config_utils import load_config
 from utils.dataset import load_dataset
 from utils.eval_utils import eval_ate, eval_rendering, save_gaussians
@@ -57,6 +59,14 @@ class SLAM:
             # Same fail-fast for the albedo init strategy (resolved again
             # by the backend for each keyframe, see BackEnd.add_next_kf).
             get_albedo_init(self.config)
+            if save_dir is not None and "params_file" in self.config["Light"]:
+                # config.yml holds only the JSON keys; the values they resolve
+                # to are the per-scene params file, saved with the run
+                # (CLAUDE.md section 10: fully resolved configuration).
+                shutil.copyfile(
+                    params_file_path(self.config),
+                    os.path.join(save_dir, "light_params.json"),
+                )
         self.use_gui = self.config["Results"]["use_gui"]
         if self.live_mode:
             # live demo always needs the viewer to monitor tracking quality

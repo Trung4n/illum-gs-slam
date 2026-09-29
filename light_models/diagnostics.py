@@ -11,11 +11,14 @@
 # Two stages per keyframe, so the source of the excess can be told apart:
 #   new - the Gaussians just created for this keyframe (Light.init_albedo);
 #   map - every Gaussian after this keyframe's mapping.
-# Printed with Log and, when the run saves results, appended to
+# Printed with Log (no square brackets in the message: Log uses rich, which
+# would swallow "[new]" / "[map]" as markup) and, when the run saves
+# results, appended to
 # <save_dir>/albedo_stats.csv.
 #
 # No torch import: only tensor methods of the input are used.
 
+import math
 import os
 
 from utils.logging_utils import Log
@@ -58,10 +61,10 @@ def log_albedo_stats(save_dir, frame_idx, stage, albedo):
     stats = albedo_stats(albedo.detach())
     row = {"frame_idx": frame_idx, "stage": stage, **stats}
     if stats["n_gaussians"] == 0:
-        Log(f"albedo [{stage}] kf {frame_idx}: no Gaussians", tag="Light")
+        Log(f"albedo stage={stage} kf {frame_idx}: no Gaussians", tag="Light")
     else:
         Log(
-            f"albedo [{stage}] kf {frame_idx}: "
+            f"albedo stage={stage} kf {frame_idx}: "
             f"{stats['frac_any_gt1']:.2%} of {stats['n_gaussians']} Gaussians > 1 "
             f"(max {stats['max']:.3f}, mean {stats['mean']:.3f})",
             tag="Light",
@@ -74,6 +77,38 @@ def log_albedo_stats(save_dir, frame_idx, stage, albedo):
         if write_header:
             f.write(",".join(_COLUMNS) + "\n")
         f.write(",".join(_format(row.get(c)) for c in _COLUMNS) + "\n")
+
+
+EXPOSURE_CSV_NAME = "exposure_stats.csv"
+_EXPOSURE_COLUMNS = ("frame_idx", "stage", "exposure_a", "exposure_b", "gain_exp_a")
+
+
+def log_exposure(save_dir, frame_idx, stage, viewpoint):
+    """Per-keyframe affine exposure (Camera.exposure_a/b), for EVERY run,
+    baseline included: reading the values changes no computation.
+
+    Why: with a co-located light the affine term can absorb the brightness
+    change caused by the moving lamp (docs/DECISIONS.md D6, step 4.3). The
+    stages mirror the albedo log: `new` = value tracked by the frontend when
+    the keyframe arrives, `map` = after this keyframe's mapping.
+    """
+    a = float(viewpoint.exposure_a.detach().item())
+    b = float(viewpoint.exposure_b.detach().item())
+    gain = math.exp(a)
+    Log(
+        f"exposure stage={stage} kf {frame_idx}: a={a:+.4f} (gain {gain:.4f}) b={b:+.4f}",
+        tag="Light",
+    )
+    if save_dir is None:
+        return
+    row = {"frame_idx": frame_idx, "stage": stage, "exposure_a": a,
+           "exposure_b": b, "gain_exp_a": gain}
+    path = os.path.join(save_dir, EXPOSURE_CSV_NAME)
+    write_header = not os.path.exists(path)
+    with open(path, "a", encoding="utf-8") as f:
+        if write_header:
+            f.write(",".join(_EXPOSURE_COLUMNS) + "\n")
+        f.write(",".join(_format(row[c]) for c in _EXPOSURE_COLUMNS) + "\n")
 
 
 def _format(value):

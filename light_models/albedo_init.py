@@ -34,6 +34,7 @@ import torch
 from light_models import read_albedo_init, read_light_tracking
 from utils.color_space import sRGB2Linear
 from utils.slam_utils import get_observed_in_loss_space, undo_exposure_affine
+from utils.config_utils import require_key
 
 
 def observed_radiance_linear(config, viewpoint):
@@ -54,11 +55,75 @@ def _observed(params, config, viewpoint, placement_depth, *, shader, render_keyf
     return observed_radiance_linear(config, viewpoint)
 
 
-# name -> (function, allowed parameter keys). A name listed in
-# light_models.ALBEDO_INIT_STRATEGIES but missing here is planned, not
-# implemented yet.
+def shading_at_depth(shader, depth, viewpoint):
+    """(3,H,W) radiance the shader predicts for a WHITE (albedo 1), fully
+    opaque surface at z-depth `depth` (H,W tensor; 0 = unknown, shaded at
+    the shader's fallback depth). The same shader SLAM renders with, so the
+    de-shading below is the exact inverse of the image formation."""
+    h, w = depth.shape
+    gbuffer = {
+        "albedo": torch.ones(3, h, w, device=depth.device, dtype=depth.dtype),
+        "depth": depth[None],
+        "opacity": (depth > 0).to(depth.dtype)[None],
+    }
+    return shader(gbuffer, viewpoint)["radiance_linear"]
+
+
+def _deshade(params, config, viewpoint, depth, shader):
+    # albedo = observation / shading. min_shading bounds the division where
+    # the model predicts (almost) no light; with a multiplicative ambient c
+    # the shading never drops below c, so min_shading < c never triggers.
+    observed = observed_radiance_linear(config, viewpoint)
+    shading = shading_at_depth(shader, depth.to(observed.device, observed.dtype), viewpoint)
+    return observed / shading.clamp_min(params["min_shading"])
+
+
+def _placement_depth_tensor(placement_depth):
+    return torch.from_numpy(placement_depth.astype("float32"))
+
+
+def _median_depth(params, config, viewpoint, placement_depth, *, shader, render_keyframe):
+    # Shading of a fronto-parallel plane at the median placement depth: one
+    # scalar depth, so the per-pixel noise of a guessed depth does not enter
+    # the albedo, but its overall scale still does.
+    z = _placement_depth_tensor(placement_depth)
+    known = z > 0
+    if not known.any():
+        raise ValueError("init_albedo median_depth: the placement depth has no valid pixel")
+    plane = torch.full_like(z, float(z[known].median()))
+    return _deshade(params, config, viewpoint, plane, shader)
+
+
+def _rendered_depth(params, config, viewpoint, placement_depth, *, shader, render_keyframe):
+    # Depth rendered from the current map where it is trusted (opacity >=
+    # Light.gbuffer.opacity_thr, D5), the placement depth elsewhere (always
+    # the case on the first keyframe, whose map is empty).
+    z = _placement_depth_tensor(placement_depth)
+    pkg = render_keyframe()
+    if pkg is not None:
+        thr = require_key(
+            require_key(config["Light"], "gbuffer", "Light"), "opacity_thr", "Light.gbuffer"
+        )
+        opacity = pkg["opacity"][0].detach()
+        trusted = opacity >= thr
+        rendered = pkg["depth"][0].detach() / torch.where(trusted, opacity, torch.ones_like(opacity))
+        z = torch.where(trusted.cpu(), rendered.cpu().to(z.dtype), z)
+    return _deshade(params, config, viewpoint, z, shader)
+
+
+def _positive_min_shading(params):
+    v = params["min_shading"]
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+        raise ValueError(f"Light.init_albedo.min_shading must be a number > 0, got {v!r}")
+
+
+# name -> (function, required parameter keys, validator). Every listed key is
+# required and no other key is accepted. A name listed in
+# light_models.ALBEDO_INIT_STRATEGIES but missing here is planned.
 _REGISTRY = {
-    "observed": (_observed, frozenset()),
+    "observed": (_observed, frozenset(), None),
+    "median_depth": (_median_depth, frozenset({"min_shading"}), _positive_min_shading),
+    "rendered_depth": (_rendered_depth, frozenset({"min_shading"}), _positive_min_shading),
 }
 
 
@@ -72,13 +137,20 @@ def get_albedo_init(config):
             f"Light.init_albedo.strategy '{settings.strategy}' is planned but "
             "not implemented yet"
         )
-    fn, allowed = _REGISTRY[settings.strategy]
-    unknown = set(settings.params) - allowed
+    fn, keys, validate = _REGISTRY[settings.strategy]
+    unknown = set(settings.params) - keys
     if unknown:
         raise ValueError(
             f"Unknown keys {sorted(unknown)} in Light.init_albedo for strategy "
-            f"'{settings.strategy}' (allowed: {sorted(allowed)})"
+            f"'{settings.strategy}' (allowed: {sorted(keys)})"
         )
+    missing = keys - set(settings.params)
+    if missing:
+        raise KeyError(
+            f"Missing required config key(s) {sorted('Light.init_albedo.' + k for k in missing)}"
+        )
+    if validate is not None:
+        validate(settings.params)
 
     def init_albedo(config, viewpoint, placement_depth, *, shader, render_keyframe):
         with torch.no_grad():
