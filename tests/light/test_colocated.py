@@ -93,6 +93,7 @@ def _gbuffer(z, albedo, normals=None):
         "albedo": torch.from_numpy(albedo).permute(2, 0, 1).double(),
         "depth": torch.from_numpy(z)[None].double(),
         "opacity": torch.ones(1, *z.shape, dtype=torch.float64),
+        "pixel_offset": 0.0,  # ground-truth-like maps: the oracle's convention
     }
     if normals is not None:
         ok = np.isfinite(normals).all(-1)
@@ -147,7 +148,8 @@ def test_depth_is_divided_by_opacity():
     shader = build_shader(_config({"type": "none"}), PARAMS)
     full = shader(_gbuffer(z, albedo), cam)["radiance_linear"]
     g = _gbuffer(z, albedo)
-    g = {"albedo": g["albedo"] * 0.8, "depth": g["depth"] * 0.8, "opacity": g["opacity"] * 0.8}
+    g = {"albedo": g["albedo"] * 0.8, "depth": g["depth"] * 0.8,
+         "opacity": g["opacity"] * 0.8, "pixel_offset": 0.0}
     weighted = shader(g, cam)["radiance_linear"]
     torch.testing.assert_close(weighted, full * 0.8)
 
@@ -216,3 +218,29 @@ def test_config_errors(light_patch, err):
     cfg["Light"].update(light_patch)
     with pytest.raises(err):
         build_shader(cfg, PARAMS)
+
+
+def test_rasterized_maps_are_shaded_along_shifted_rays():
+    # A rasterized map (pixel_offset 0.5) of the same scene must equal the
+    # oracle evaluated on the OpenCV grid shifted by half a pixel (D29).
+    common = _common()
+    z, P, n, albedo, cam = _scene(common)
+    shader = build_shader(_config({"type": "none"}), PARAMS)
+    g = _gbuffer(z, albedo)
+    g["pixel_offset"] = 0.5
+    got = shader(g, cam)["radiance_linear"].permute(1, 2, 0).numpy()
+    v, u = np.mgrid[0:common.H, 0:common.W].astype(np.float64)
+    xn, yn = (u + 0.5 - common.CX) / common.FX, (v + 0.5 - common.CY) / common.FY
+    P_shift = np.stack([xn * z, yn * z, z], -1)
+    np.testing.assert_allclose(got, _oracle(common, P_shift, n, albedo, cosine=False),
+                               rtol=1e-5, atol=1e-7)
+
+
+def test_pixel_offset_is_required():
+    common = _common()
+    z, P, n, albedo, cam = _scene(common)
+    shader = build_shader(_config({"type": "none"}), PARAMS)
+    g = _gbuffer(z, albedo)
+    del g["pixel_offset"]
+    with pytest.raises(KeyError):
+        shader(g, cam)

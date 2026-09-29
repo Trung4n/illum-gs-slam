@@ -133,4 +133,27 @@ def test_every_root_config_states_baseline_explicitly(path):
         "loss_color_space": "srgb",
         "exposure_affine": True,
         "pixel_weight": {"enabled": False},
+        "saturation_mask": {"enabled": False},
     }, path
+
+
+@pytest.mark.parametrize(
+    "name, light_enabled",
+    [
+        ("configs/light/baseline_satmask.yaml", False),
+        ("configs/light/4_2_nocos_sat.yaml", True),
+        ("configs/light/4_2_lambert_sat.yaml", True),
+    ],
+)
+def test_saturation_configs_resolve(monkeypatch, name, light_enabled):
+    from light_models import read_light_tracking
+    from utils.config_utils import load_config
+
+    monkeypatch.chdir(REPO)
+    cfg = load_config(name)
+    assert cfg["Light"]["enabled"] is light_enabled
+    sm = read_light_tracking(cfg).saturation_mask
+    assert (sm.enabled, sm.mode, sm.apply_to) == (True, "pixel", ("tracking", "mapping"))
+    # The three runs must use the same threshold to be comparable.
+    base = read_light_tracking(load_config("configs/light/baseline_satmask.yaml"))
+    assert sm.threshold_8bit == base.saturation_mask.threshold_8bit

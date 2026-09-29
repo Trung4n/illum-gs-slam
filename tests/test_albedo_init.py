@@ -1,6 +1,5 @@
-"""light_models/albedo_init.py (needs torch; the image tests also need CUDA)
-and GaussianModel._sample_map_at_points (needs open3d + the simple_knn
-extension, checked against Open3D's own back-projection).
+"""light_models/albedo_init.py (needs torch; the image tests also need CUDA).
+The pixel labelling of new Gaussians is tested in tests/test_pixel_index.py.
 
     python -m pytest tests/test_albedo_init.py
 """
@@ -25,6 +24,7 @@ def _config(strategy="observed", space="srgb", affine=False, **params):
             "loss_color_space": space,
             "exposure_affine": affine,
             "pixel_weight": {"enabled": False},
+            "saturation_mask": {"enabled": False},
         },
     }
 
@@ -140,49 +140,3 @@ def test_observed_undoes_affine_in_linear_loss_space():
     albedo = _call(_config(space="linear", affine=True), vp)
     reobserved = torch.exp(vp.exposure_a) * albedo + vp.exposure_b
     torch.testing.assert_close(reobserved, sRGB2Linear(vp.original_image.cuda()))
-
-
-def test_sample_map_matches_open3d_backprojection():
-    # Oracle: encode each pixel index in an 8-bit RGB image, let Open3D
-    # back-project and downsample it exactly as create_pcd_from_image_and_depth
-    # does, decode the index from the output colors, and compare with the
-    # pixel _sample_map_at_points finds by projection.
-    o3d = pytest.importorskip("open3d")
-    pytest.importorskip("simple_knn._C")
-    from gaussian_splatting.scene.gaussian_model import GaussianModel
-    from gaussian_splatting.utils.graphics_utils import getWorld2View2
-
-    h, w = 40, 60
-    rng = np.random.default_rng(0)
-    cam = SimpleNamespace(fx=55.0, fy=52.0, cx=29.5, cy=19.5)
-    angle = 0.3
-    R = torch.tensor(
-        [[np.cos(angle), 0, np.sin(angle)], [0, 1, 0], [-np.sin(angle), 0, np.cos(angle)]],
-        dtype=torch.float32,
-    )
-    T = torch.tensor([0.1, -0.2, 0.5], dtype=torch.float32)
-    W2C = getWorld2View2(R, T).cpu().numpy()
-
-    idx = np.arange(h * w).reshape(h, w)
-    code = np.stack([(idx >> 16) & 255, (idx >> 8) & 255, idx & 255], -1).astype(np.uint8)
-    depth = rng.uniform(0.5, 5.0, (h, w)).astype(np.float32)
-    depth[rng.random((h, w)) < 0.2] = 0.0  # pixels without Gaussians
-    rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-        o3d.geometry.Image(code),
-        o3d.geometry.Image(depth),
-        depth_scale=1.0,
-        depth_trunc=100.0,
-        convert_rgb_to_intensity=False,
-    )
-    pcd = o3d.geometry.PointCloud.create_from_rgbd_image(
-        rgbd,
-        o3d.camera.PinholeCameraIntrinsic(w, h, cam.fx, cam.fy, cam.cx, cam.cy),
-        extrinsic=W2C,
-        project_valid_depth_only=True,
-    ).random_down_sample(0.3)
-    c = np.rint(np.asarray(pcd.colors) * 255).astype(np.int64)
-    expected = (c[:, 0] << 16) | (c[:, 1] << 8) | c[:, 2]
-
-    index_map = torch.from_numpy(idx[None].astype(np.float64))
-    got = GaussianModel._sample_map_at_points(index_map, np.asarray(pcd.points), cam, W2C)
-    np.testing.assert_array_equal(got[:, 0].astype(np.int64), expected)

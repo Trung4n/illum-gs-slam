@@ -116,6 +116,7 @@ def read_light_tracking(config):
         loss_color_space=space,
         exposure_affine=affine,
         pixel_weight=_read_pixel_weight(block, config),
+        saturation_mask=_read_saturation_mask(block),
     )
 
 
@@ -158,3 +159,53 @@ def _read_pixel_weight(block, config):
     if isinstance(min_cos, bool) or not isinstance(min_cos, (int, float)) or not -1 <= min_cos <= 1:
         raise ValueError(f"{where}.min_cos_nl must be a number in [-1, 1], got {min_cos!r}")
     return SimpleNamespace(enabled=True, apply_to=tuple(apply_to), min_cos_nl=float(min_cos))
+
+
+# How a saturated observation is excluded (docs/DECISIONS.md D31):
+#   pixel   - a pixel saturated in ANY channel is dropped in all three;
+#   channel - only the saturated channel values are dropped.
+SATURATION_MODES = ("pixel", "channel")
+_SATURATION_KEYS = ("enabled", "mode", "threshold_8bit", "apply_to")
+
+
+def _read_saturation_mask(block):
+    """LightTracking.saturation_mask: {enabled: false} or
+    {enabled: true, mode: pixel|channel, threshold_8bit: <1..255>,
+     apply_to: [tracking|mapping, ...]}.
+
+    Computed on the OBSERVED image only (its 8-bit codes, before any gamma
+    removal, CLAUDE.md section 6), never on the prediction: a pixel predicted
+    above 1 whose observation is not saturated stays in the loss, since that
+    is exactly where the model is wrong. It therefore needs no light model
+    and also applies with Light.enabled: false (the baseline + mask control).
+    """
+    where = "LightTracking.saturation_mask"
+    sm = require_key(block, "saturation_mask", "LightTracking")
+    if not isinstance(sm, dict):
+        raise TypeError(f"{where} must be a block, got {sm!r}")
+    unknown = set(sm) - set(_SATURATION_KEYS)
+    if unknown:
+        raise ValueError(f"{where}: unexpected keys {sorted(unknown)}")
+    enabled = require_key(sm, "enabled", where)
+    if not isinstance(enabled, bool):
+        raise TypeError(f"{where}.enabled must be true or false, got {enabled!r}")
+    if not enabled:
+        return SimpleNamespace(enabled=False, mode=None, threshold_8bit=None, apply_to=())
+    mode = require_key(sm, "mode", where)
+    if mode not in SATURATION_MODES:
+        raise ValueError(f"{where}.mode must be one of {SATURATION_MODES}, got {mode!r}")
+    thr = require_key(sm, "threshold_8bit", where)
+    if isinstance(thr, bool) or not isinstance(thr, int) or not 1 <= thr <= 255:
+        raise ValueError(f"{where}.threshold_8bit must be an integer in [1, 255], got {thr!r}")
+    apply_to = require_key(sm, "apply_to", where)
+    if (
+        not isinstance(apply_to, list)
+        or not apply_to
+        or len(set(apply_to)) != len(apply_to)
+        or not set(apply_to) <= set(PIXEL_WEIGHT_TARGETS)
+    ):
+        raise ValueError(
+            f"{where}.apply_to must be a non-empty list of distinct values from "
+            f"{PIXEL_WEIGHT_TARGETS}, got {apply_to!r}"
+        )
+    return SimpleNamespace(enabled=True, mode=mode, threshold_8bit=thr, apply_to=tuple(apply_to))

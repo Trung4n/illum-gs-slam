@@ -69,6 +69,17 @@ def getProjectionMatrix(znear, zfar, fovX, fovY):
     return P
 
 
+# Pixel convention of the rasterizer (docs/DECISIONS.md D29). With
+# getProjectionMatrix2 below and the CUDA ndc2Pix, pix = ((ndc + 1) * S - 1) / 2,
+# a camera-frame point lands at
+#     pix_x = fx * x / z + cx - 0.5      (same for y)
+# while the data and Open3D use the OpenCV convention pix_x = fx * x / z + cx
+# (integer pixel centers). So rasterized pixel i looks along the OpenCV ray
+# through i + RASTERIZER_PIXEL_OFFSET. A property of MonoGS's projection code,
+# not a tunable value; tests/test_pixel_convention.py re-derives it.
+RASTERIZER_PIXEL_OFFSET = 0.5
+
+
 def getProjectionMatrix2(znear, zfar, cx, cy, fx, fy, W, H):
     left = ((2 * cx - W) / W - 1.0) * W / 2.0
     right = ((2 * cx - W) / W + 1.0) * W / 2.0

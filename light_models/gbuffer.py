@@ -17,16 +17,19 @@
 import torch
 
 
-def pixel_rays(camera, height, width, device, dtype):
-    """(3,H,W) K^-1 [u, v, 1]: u = column, v = row, pixel centers at integers
-    (same convention as Open3D's back-projection used to create Gaussians)."""
+def pixel_rays(camera, height, width, device, dtype, pixel_offset):
+    """(3,H,W) K^-1 [u + o, v + o, 1] for pixel (row v, column u), K in the
+    OpenCV convention of the data (integer pixel centers). o = pixel_offset
+    is where the map's pixel i sits on that grid: 0 for maps in the data's
+    own convention (ground-truth passes, the placement depth), 0.5 for
+    rasterized maps (RASTERIZER_PIXEL_OFFSET, docs/DECISIONS.md D29)."""
     v, u = torch.meshgrid(
         torch.arange(height, device=device, dtype=dtype),
         torch.arange(width, device=device, dtype=dtype),
         indexing="ij",
     )
-    x = (u - camera.cx) / camera.fx
-    y = (v - camera.cy) / camera.fy
+    x = (u + pixel_offset - camera.cx) / camera.fx
+    y = (v + pixel_offset - camera.cy) / camera.fy
     return torch.stack([x, y, torch.ones_like(x)], dim=0)
 
 
@@ -51,5 +54,7 @@ def surface_points(gbuffer, camera, opacity_thr):
             fallback = (depth[covered] / opacity[covered]).median()
     z = torch.where(valid, z, fallback)
     h, w = depth.shape
-    rays = pixel_rays(camera, h, w, depth.device, depth.dtype)
+    # Required: which pixel convention the maps follow (D29).
+    offset = gbuffer["pixel_offset"]
+    rays = pixel_rays(camera, h, w, depth.device, depth.dtype, offset)
     return rays * z[None], valid

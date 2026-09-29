@@ -65,6 +65,9 @@ def shading_at_depth(shader, depth, viewpoint):
         "albedo": torch.ones(3, h, w, device=depth.device, dtype=depth.dtype),
         "depth": depth[None],
         "opacity": (depth > 0).to(depth.dtype)[None],
+        # The placement depth is indexed like the observed image (Open3D /
+        # OpenCV pixel centers), not like a rasterized map (D29).
+        "pixel_offset": 0.0,
     }
     return shader(gbuffer, viewpoint)["radiance_linear"]
 
@@ -73,6 +76,14 @@ def _deshade(params, config, viewpoint, depth, shader):
     # albedo = observation / shading. min_shading bounds the division where
     # the model predicts (almost) no light; with a multiplicative ambient c
     # the shading never drops below c, so min_shading < c never triggers.
+    #
+    # Saturated observations are NOT left empty (docs/DECISIONS.md D32):
+    # there the observation is only a LOWER bound on the true radiance, and
+    # every step here keeps the inequality (inverse affine: exp(a) > 0;
+    # sRGB -> linear: increasing; / shading > 0), so the value computed is
+    # the lower bound A >= observed / s (A >= 1/s for a code of 255 without
+    # affine). With LightTracking.saturation_mask on, those pixels never
+    # reach the loss, so this bound is all the Gaussian starts from.
     observed = observed_radiance_linear(config, viewpoint)
     shading = shading_at_depth(shader, depth.to(observed.device, observed.dtype), viewpoint)
     return observed / shading.clamp_min(params["min_shading"])

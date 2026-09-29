@@ -27,6 +27,7 @@ from gaussian_splatting.utils.general_utils import (
     strip_symmetric,
 )
 from gaussian_splatting.utils.graphics_utils import BasicPointCloud, getWorld2View2
+from gaussian_splatting.utils.pixel_index import decode_pixel_index, pixel_index_image
 from gaussian_splatting.utils.sh_utils import RGB2SH, SH2RGB
 from gaussian_splatting.utils.system_utils import mkdir_p
 
@@ -190,12 +191,19 @@ class GaussianModel:
         # Otherwise a (3,H,W) LINEAR albedo map from
         # light_models/albedo_init.py; each new Gaussian takes the value at
         # its own pixel (see create_pcd_from_image_and_depth). The 8-bit
-        # image below is then only a carrier for Open3D's back-projection.
+        # "color" given to Open3D is then the PIXEL INDEX of every pixel
+        # (gaussian_splatting/utils/pixel_index.py), so the points come back
+        # labelled with the pixel they were back-projected from, exactly
+        # (docs/DECISIONS.md D28).
         # Required keyword on purpose (docs/DECISIONS.md D10).
         cam = cam_info
-        image_ab = (torch.exp(cam.exposure_a)) * cam.original_image + cam.exposure_b
-        image_ab = torch.clamp(image_ab, 0.0, 1.0)
-        rgb_raw = (image_ab * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy()
+        if albedo_map is None:
+            image_ab = (torch.exp(cam.exposure_a)) * cam.original_image + cam.exposure_b
+            image_ab = torch.clamp(image_ab, 0.0, 1.0)
+            rgb_raw = (image_ab * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy()
+        else:
+            _, h, w = albedo_map.shape
+            rgb_raw = pixel_index_image(h, w)
 
         if depthmap is not None:
             # The path always taken in MonoGS: depth prepared by
@@ -277,11 +285,13 @@ class GaussianModel:
         new_xyz = np.asarray(pcd_tmp.points)
         new_rgb = np.asarray(pcd_tmp.colors)
         if albedo_map is not None:
-            # Light model: replace the 8-bit sRGB colors by the float linear
-            # albedo of each point's own pixel. Open3D's random_down_sample
-            # does not report which pixels it kept, so each point is
-            # projected back with the same pose and intrinsics.
-            new_rgb = self._sample_map_at_points(albedo_map, new_xyz, cam, W2C)
+            # Light model: the "colors" are pixel indices (see
+            # create_pcd_from_image); replace them by the float linear albedo
+            # of each point's own pixel.
+            idx = decode_pixel_index(new_rgb)
+            _, h, w = albedo_map.shape
+            values = albedo_map.detach().cpu().double().numpy().reshape(3, h * w)
+            new_rgb = values[:, idx].T  # (N, 3)
 
         pcd = BasicPointCloud(
             points=new_xyz, colors=new_rgb, normals=np.zeros((new_xyz.shape[0], 3))
@@ -327,35 +337,6 @@ class GaussianModel:
 
         return fused_point_cloud, features, scales, rots, opacities
 
-    @staticmethod
-    def _sample_map_at_points(image_map, points_world, cam, W2C):
-        # Value of a (C,H,W) map at the pixel each world point was
-        # back-projected from by Open3D in create_pcd_from_image_and_depth.
-        # Open3D uses x = (u - cx) * z / fx with u the integer column (same
-        # for v), so projecting with the SAME W2C and intrinsics returns
-        # integer pixel coordinates up to float round-off.
-        pts = np.asarray(points_world, dtype=np.float64)
-        W2C = np.asarray(W2C, dtype=np.float64)
-        p_cam = pts @ W2C[:3, :3].T + W2C[:3, 3]
-        u = cam.fx * p_cam[:, 0] / p_cam[:, 2] + cam.cx
-        v = cam.fy * p_cam[:, 1] / p_cam[:, 2] + cam.cy
-        u_px, v_px = np.rint(u), np.rint(v)
-        # Consistency check, not a tunable threshold: round-off is ~1e-9 px,
-        # while a wrong pixel convention (e.g. a half-pixel shift) would show
-        # up as 0.5 px. A quarter pixel separates the two cases.
-        off = max(np.abs(u - u_px).max(initial=0.0), np.abs(v - v_px).max(initial=0.0))
-        if off > 0.25:
-            raise RuntimeError(
-                f"Projected points are {off:.3f} px off the pixel grid: pixel "
-                "convention differs from Open3D's back-projection"
-            )
-        u_px, v_px = u_px.astype(np.int64), v_px.astype(np.int64)
-        _, h, w = image_map.shape
-        if (u_px.min(initial=0) < 0 or v_px.min(initial=0) < 0
-                or u_px.max(initial=0) >= w or v_px.max(initial=0) >= h):
-            raise RuntimeError("Projected points fall outside the image")
-        values = image_map.detach().cpu().double().numpy()
-        return values[:, v_px, u_px].T  # (N, C)
 
     def init_lr(self, spatial_lr_scale):
         # spatial_lr_scale: multiplies the xyz and scaling learning rates, so

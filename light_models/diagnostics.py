@@ -111,6 +111,36 @@ def log_exposure(save_dir, frame_idx, stage, viewpoint):
         f.write(",".join(_format(row[c]) for c in _EXPOSURE_COLUMNS) + "\n")
 
 
+PIXEL_USAGE_CSV_NAME = "pixel_usage.csv"
+_PIXEL_USAGE_COLUMNS = (
+    "frame_idx",
+    "frac_saturated_px",
+    "frac_saturated_values",
+    "frac_removed_saturation",
+    "frac_removed_light_weight",
+    "frac_used_monogs_masks",
+    "frac_used_tracking",
+)
+
+
+def log_pixel_usage(save_dir, frame_idx, stats):
+    """One row per tracked frame (utils/slam_utils.pixel_usage_stats), next
+    to albedo_stats.csv; CSV only, no console line (one per frame would
+    drown the log). Empty cells = criterion disabled. Written only when an
+    extension mask is enabled (stats is None otherwise) and results are
+    saved. frac_saturated_px / _values are reported whatever the mode, so the
+    two modes can be compared from one run."""
+    if stats is None or save_dir is None:
+        return
+    path = os.path.join(save_dir, PIXEL_USAGE_CSV_NAME)
+    write_header = not os.path.exists(path)
+    row = {"frame_idx": frame_idx, **stats}
+    with open(path, "a", encoding="utf-8") as f:
+        if write_header:
+            f.write(",".join(_PIXEL_USAGE_COLUMNS) + "\n")
+        f.write(",".join(_format(row.get(c)) for c in _PIXEL_USAGE_COLUMNS) + "\n")
+
+
 def _format(value):
     if value is None:
         return ""

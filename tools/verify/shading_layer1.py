@@ -71,6 +71,8 @@ def gbuffer_from_gt(alb8, z, n):
         "albedo": albedo,
         "depth": torch.from_numpy(z)[None],
         "opacity": torch.from_numpy(valid.astype(np.float64))[None],
+        # Ground-truth passes follow the data's pixel convention (D29).
+        "pixel_offset": 0.0,
         "normal": torch.from_numpy(n).permute(2, 0, 1),
         "normal_valid": torch.from_numpy(n_valid),
     }
@@ -87,7 +89,7 @@ def light_geometry(config, params, cam, z):
     half = resolve_param(ang["half_angle_deg"], "a", params).value
     blend = resolve_param(ang["blend"], "b", params).value
     zt = torch.from_numpy(z)
-    pts = pixel_rays(cam, z.shape[0], z.shape[1], "cpu", DTYPE) * zt[None]
+    pts = pixel_rays(cam, z.shape[0], z.shape[1], "cpu", DTYPE, 0.0) * zt[None]
     v = pts - t.view(3, 1, 1)
     cos_th = ((v * axis.view(3, 1, 1)).sum(0) / v.norm(dim=0)).numpy()
     cos_a = math.cos(math.radians(half))

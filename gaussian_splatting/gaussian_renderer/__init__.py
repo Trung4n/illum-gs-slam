@@ -18,6 +18,7 @@ from diff_gaussian_rasterization import (
 )
 
 from gaussian_splatting.scene.gaussian_model import GaussianModel
+from gaussian_splatting.utils.graphics_utils import RASTERIZER_PIXEL_OFFSET
 from gaussian_splatting.utils.sh_utils import eval_sh
 from utils.color_space import linear2sRGB
 
@@ -267,7 +268,13 @@ def render(
     # space; the loss picks "render" or "radiance_linear" according to
     # LightTracking.loss_color_space.
     if shader is not None:
-        gbuffer = {"albedo": rendered_image, "depth": depth, "opacity": opacity}
+        gbuffer = {
+            "albedo": rendered_image,
+            "depth": depth,
+            "opacity": opacity,
+            # Rasterized pixel i looks along OpenCV ray i + 0.5 (D29).
+            "pixel_offset": RASTERIZER_PIXEL_OFFSET,
+        }
         shaded = shader(gbuffer, viewpoint_camera)
         radiance_linear = shaded["radiance_linear"]
         if radiance_linear.shape != rendered_image.shape:

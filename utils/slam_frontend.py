@@ -12,7 +12,8 @@ from utils.eval_utils import eval_ate, save_gaussians
 from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
-from utils.slam_utils import get_loss_tracking, get_median_depth
+from light_models.diagnostics import log_pixel_usage
+from utils.slam_utils import get_loss_tracking, get_median_depth, pixel_usage_stats
 
 
 class FrontEnd(mp.Process):
@@ -301,6 +302,12 @@ class FrontEnd(mp.Process):
         # render, i.e. one pose update before the final pose (negligible once
         # converged).
         self.median_depth = get_median_depth(depth, opacity)
+        # Fraction of pixels removed by the extension masks (saturation,
+        # n . l), from the last tracking render; CSV only, and only when
+        # such a mask is enabled (light_models/diagnostics.py).
+        log_pixel_usage(
+            self.save_dir, cur_frame_idx, pixel_usage_stats(self.config, render_pkg, viewpoint)
+        )
         return render_pkg
 
     def is_keyframe(

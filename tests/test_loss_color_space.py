@@ -32,6 +32,7 @@ def _config(space="srgb", affine=True, light_enabled=None):
             "loss_color_space": space,
             "exposure_affine": affine,
             "pixel_weight": {"enabled": False},
+            "saturation_mask": {"enabled": False},
         },
         "Training": {"monocular": True, "rgb_boundary_threshold": RGB_BOUNDARY},
     }
@@ -139,3 +140,36 @@ def test_mask_uses_observed_image_not_linearized_target():
     pkg["radiance_linear"] = pkg["radiance_linear"].detach().clone().requires_grad_(True)
     get_loss_mapping(_config("linear", affine=False), pkg, vp).backward()
     assert pkg["radiance_linear"].grad[:, 1, 1].abs().sum() > 0
+
+
+def _sat_config(mode):
+    cfg = _config(affine=False)
+    cfg["LightTracking"]["saturation_mask"] = {
+        "enabled": True, "mode": mode, "threshold_8bit": 250, "apply_to": ["tracking", "mapping"],
+    }
+    return cfg
+
+
+@pytest.mark.parametrize("mode", ["pixel", "channel"])
+def test_saturated_observation_gets_no_gradient(mode):
+    pkg, vp = _render_pkg(), _viewpoint()
+    vp.original_image[:, 2, 3] = torch.tensor([1.0, 0.5, 0.5])  # R saturated (code 255)
+    vp.original_image[:, 4, 5] = 0.5                              # not saturated...
+    with torch.no_grad():
+        pkg["render"][:, 4, 5] = 1.7                              # ...but predicted > 1
+    get_loss_mapping(_sat_config(mode), pkg, vp).backward()
+    g = pkg["render"].grad
+    assert g[0, 2, 3] == 0                      # the saturated value is ignored
+    if mode == "pixel":
+        assert (g[:, 2, 3] == 0).all()          # ...and so is its whole pixel
+    else:
+        assert (g[1:, 2, 3] != 0).all()         # ...only that channel
+    # Masked on the OBSERVATION only: a prediction above 1 on a non-saturated
+    # observation is a model error and must still be corrected (D31).
+    assert (g[:, 4, 5] != 0).all()
+
+
+def test_saturation_mask_off_is_baseline():
+    pkg, vp = _render_pkg(), _viewpoint()
+    vp.original_image[:, 2, 3] = 1.0
+    assert torch.equal(get_loss_tracking(_config(), pkg, vp), _baseline_tracking(pkg, vp))

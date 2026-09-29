@@ -8,7 +8,11 @@ def _config(light_tracking=None, light_enabled=False):
     cfg = {"Light": {"enabled": light_enabled}, "Training": {"spherical_harmonics": False}}
     if light_tracking is not None:
         # Tests about other keys get the baseline pixel_weight block.
-        cfg["LightTracking"] = {"pixel_weight": {"enabled": False}, **light_tracking}
+        cfg["LightTracking"] = {
+            "pixel_weight": {"enabled": False},
+            "saturation_mask": {"enabled": False},
+            **light_tracking,
+        }
     return cfg
 
 
@@ -63,13 +67,19 @@ def test_baseline_values_accepted_with_light_disabled():
     assert (s.loss_color_space, s.exposure_affine) == ("srgb", True)
 
 
-def _lt(pixel_weight):
-    return {"loss_color_space": "srgb", "exposure_affine": False, "pixel_weight": pixel_weight}
+def _lt(pixel_weight, saturation_mask=None):
+    return {
+        "loss_color_space": "srgb",
+        "exposure_affine": False,
+        "pixel_weight": pixel_weight,
+        "saturation_mask": saturation_mask or {"enabled": False},
+    }
 
 
 def test_pixel_weight_block_required():
     cfg = {"Light": {"enabled": True},
-           "LightTracking": {"loss_color_space": "srgb", "exposure_affine": False}}
+           "LightTracking": {"loss_color_space": "srgb", "exposure_affine": False,
+                             "saturation_mask": {"enabled": False}}}
     with pytest.raises(KeyError, match="LightTracking.pixel_weight"):
         read_light_tracking(cfg)
 
@@ -117,3 +127,51 @@ def test_pixel_weight_enabled_parsed():
     block = {"enabled": True, "apply_to": ["tracking", "mapping"], "min_cos_nl": 0.3}
     pw = read_light_tracking(_config(_lt(block), light_enabled=True)).pixel_weight
     assert (pw.enabled, pw.apply_to, pw.min_cos_nl) == (True, ("tracking", "mapping"), 0.3)
+
+
+_SAT = {"enabled": True, "mode": "pixel", "threshold_8bit": 250, "apply_to": ["tracking", "mapping"]}
+
+
+def test_saturation_block_required():
+    cfg = {"Light": {"enabled": False},
+           "LightTracking": {"loss_color_space": "srgb", "exposure_affine": True,
+                             "pixel_weight": {"enabled": False}}}
+    with pytest.raises(KeyError, match="LightTracking.saturation_mask"):
+        read_light_tracking(cfg)
+
+
+def test_saturation_works_with_light_disabled():
+    sm = read_light_tracking(_config(_lt({"enabled": False}, _SAT))).saturation_mask
+    assert (sm.enabled, sm.mode, sm.threshold_8bit, sm.apply_to) == (
+        True, "pixel", 250, ("tracking", "mapping"))
+
+
+@pytest.mark.parametrize("missing", ["mode", "threshold_8bit", "apply_to"])
+def test_saturation_keys_required(missing):
+    block = dict(_SAT)
+    del block[missing]
+    with pytest.raises(KeyError, match=f"saturation_mask.{missing}"):
+        read_light_tracking(_config(_lt({"enabled": False}, block)))
+
+
+@pytest.mark.parametrize(
+    "patch, match",
+    [
+        ({"mode": "any"}, "mode"),
+        ({"threshold_8bit": 250.0}, "threshold_8bit"),
+        ({"threshold_8bit": 0}, "threshold_8bit"),
+        ({"threshold_8bit": 256}, "threshold_8bit"),
+        ({"threshold_8bit": True}, "threshold_8bit"),
+        ({"apply_to": []}, "apply_to"),
+        ({"apply_to": ["refinement"]}, "apply_to"),
+        ({"extra": 1}, "unexpected keys"),
+    ],
+)
+def test_saturation_values_validated(patch, match):
+    with pytest.raises(ValueError, match=match):
+        read_light_tracking(_config(_lt({"enabled": False}, {**_SAT, **patch})))
+
+
+def test_saturation_disabled():
+    sm = read_light_tracking(_config(_lt({"enabled": False}))).saturation_mask
+    assert sm.enabled is False and sm.apply_to == ()

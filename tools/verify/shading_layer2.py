@@ -97,6 +97,16 @@ def check_frame(config, params, frame_dir, uid, device):
         mask = base & (op >= thr)
         variants[name] = {r: l1.summarize(pred, rgb8, mask & m) for r, m in regions.items()}
         variants[name]["opacity_ge_thr_frac"] = float((op >= thr).mean())
+        variants[name]["opacity_median_selected"] = float(np.median(op[mask])) if mask.any() else None
+        # Same prediction as if the map covered the pixel fully (albedo is
+        # opacity-weighted, D5). The Gaussians built here from ground truth
+        # sit on the data's pixel grid, i.e. half a pixel off the rasterizer's
+        # (D29), so they never cover a rasterized pixel completely; a gap
+        # that disappears here is that construction, not the shader.
+        full = pred / np.where(op > 0, op, 1.0)[..., None]
+        variants[name + "_full_coverage"] = {
+            r: l1.summarize(full, rgb8, mask & m) for r, m in regions.items()
+        }
     return variants
 
 
@@ -118,8 +128,12 @@ def main(argv=None):
         results[i] = res
         print(f"frame {i}")
         for variant, regions in res.items():
-            print(f"  {variant}: rasterized opacity >= thr on "
-                  f"{regions['opacity_ge_thr_frac']:.1%} of the image")
+            if "opacity_ge_thr_frac" in regions:
+                print(f"  {variant}: rasterized opacity >= thr on "
+                      f"{regions['opacity_ge_thr_frac']:.1%} of the image, median opacity "
+                      f"of the compared pixels {regions['opacity_median_selected']:.3f}")
+            else:
+                print(f"  {variant}:")
             for region in ("core", "rim", "outside"):
                 s = regions[region]
                 if s["n_px"] == 0:

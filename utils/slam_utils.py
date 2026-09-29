@@ -80,6 +80,56 @@ def get_light_pixel_weight(config, render_pkg, target):
     return keep.to(render_pkg["light_cos_nl"].dtype)
 
 
+# LightTracking.saturation_mask.mode -> how the per-channel test becomes the
+# mask applied to the loss (docs/DECISIONS.md D31).
+_SATURATION_REDUCE = {
+    "pixel": lambda sat: sat.any(dim=0, keepdim=True),  # (1,H,W): drop all 3
+    "channel": lambda sat: sat,  # (3,H,W): drop only the saturated values
+}
+
+
+def saturated_observations(observed, mode, threshold_8bit):
+    # Bool mask of saturated OBSERVED values, from the image's 8-bit codes as
+    # stored (before any gamma removal, CLAUDE.md section 6). The dataset
+    # loader divides the 8-bit image by 255; rounding back to codes avoids
+    # float round-off moving a code across the threshold.
+    codes = torch.round(observed * 255.0)
+    return _SATURATION_REDUCE[mode](codes >= threshold_8bit)
+
+
+def get_saturation_keep(config, viewpoint, target):
+    # 0/1 mask (1,H,W or 3,H,W) keeping the non-saturated observations for
+    # `target` ("tracking" or "mapping"), or None when the mask is off. Uses
+    # the observation only, never the prediction: a predicted value above 1
+    # on a non-saturated observation is a model error and stays in the loss.
+    sm = read_light_tracking(config).saturation_mask
+    if not sm.enabled or target not in sm.apply_to:
+        return None
+    observed = viewpoint.original_image.cuda()
+    sat = saturated_observations(observed, sm.mode, sm.threshold_8bit)
+    return (~sat).to(observed.dtype)
+
+
+def get_loss_weight(config, render_pkg, viewpoint, target):
+    # Product of every extension mask that applies to `target`: saturation
+    # (observation only) and the light-model pixel weight (n . l). None when
+    # none applies, so the loss is then computed exactly as the baseline's.
+    weights = [
+        w
+        for w in (
+            get_saturation_keep(config, viewpoint, target),
+            get_light_pixel_weight(config, render_pkg, target),
+        )
+        if w is not None
+    ]
+    if not weights:
+        return None
+    weight = weights[0]
+    for w in weights[1:]:
+        weight = weight * w
+    return weight
+
+
 def image_gradient(image):
     # Compute image gradient using Scharr Filter
     # Returns per-channel (vertical, horizontal) derivatives, same (C,H,W)
@@ -168,7 +218,7 @@ def get_loss_tracking(config, render_pkg, viewpoint):
     image, gt_image = get_loss_images(config, render_pkg, viewpoint)
     image = apply_exposure_affine(config, image, viewpoint)
     depth, opacity = render_pkg["depth"], render_pkg["opacity"]
-    weight = get_light_pixel_weight(config, render_pkg, "tracking")
+    weight = get_loss_weight(config, render_pkg, viewpoint, "tracking")
     if config["Training"]["monocular"]:
         return get_loss_tracking_rgb(
             config, image, gt_image, depth, opacity, viewpoint, weight
@@ -182,6 +232,20 @@ def get_loss_tracking_rgb(config, image, gt_image, depth, opacity, viewpoint, pi
     # Photometric tracking loss (monocular case, and also the RGB term of the
     # RGB-D tracking loss). `image`/`gt_image` are already in the loss color
     # space (see get_loss_tracking). `depth` is unused.
+    rgb_pixel_mask = tracking_rgb_mask(config, viewpoint, pixel_weight)
+    # Weighting by rendered `opacity` (per-pixel accumulated alpha) makes the
+    # loss ignore pixels the map doesn't cover yet: there the rendering is
+    # just background, and matching it would drag the pose toward nonsense.
+    l1 = opacity * torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
+    # Mean over ALL pixels (masked ones contribute 0), so the loss magnitude
+    # scales with the fraction of valid pixels.
+    return l1.mean()
+
+
+def tracking_rgb_mask(config, viewpoint, pixel_weight):
+    # The pixel mask of the photometric tracking loss, also used to log the
+    # fraction of usable pixels (light_models/diagnostics.py), so the log
+    # and the loss cannot drift apart. pixel_weight: get_loss_weight().
     observed = viewpoint.original_image.cuda()
     _, h, w = observed.shape
     mask_shape = (1, h, w)
@@ -194,16 +258,46 @@ def get_loss_tracking_rgb(config, image, gt_image, depth, opacity, viewpoint, pi
     # ...and additionally keep only high-gradient (edge) pixels, see
     # Camera.compute_grad_mask(): flat regions give almost no pose signal.
     rgb_pixel_mask = rgb_pixel_mask * viewpoint.grad_mask
-    # Light-model pixel weight (get_light_pixel_weight); None = baseline.
+    # Extension masks (get_loss_weight); None = baseline, op for op.
     if pixel_weight is not None:
         rgb_pixel_mask = rgb_pixel_mask * pixel_weight
-    # Weighting by rendered `opacity` (per-pixel accumulated alpha) makes the
-    # loss ignore pixels the map doesn't cover yet: there the rendering is
-    # just background, and matching it would drag the pose toward nonsense.
-    l1 = opacity * torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
-    # Mean over ALL pixels (masked ones contribute 0), so the loss magnitude
-    # scales with the fraction of valid pixels.
-    return l1.mean()
+    return rgb_pixel_mask
+
+
+def pixel_usage_stats(config, render_pkg, viewpoint):
+    # Per-frame fractions for light_models/diagnostics.log_pixel_usage, or
+    # None when no extension mask is enabled (nothing to report). Fractions
+    # are over the 3 x H x W observed values; "used" means the tracking loss
+    # mask is non-zero (MonoGS's own boundary + gradient masks included).
+    lt = read_light_tracking(config)
+    sm, pw = lt.saturation_mask, lt.pixel_weight
+    if not sm.enabled and not pw.enabled:
+        return None
+    with torch.no_grad():
+        observed = viewpoint.original_image.cuda()
+        ones = torch.ones_like(observed)
+
+        def frac(mask):
+            return float((mask * ones).mean())
+
+        stats = {}
+        if sm.enabled:
+            stats["frac_saturated_px"] = frac(
+                saturated_observations(observed, "pixel", sm.threshold_8bit).float()
+            )
+            stats["frac_saturated_values"] = frac(
+                saturated_observations(observed, "channel", sm.threshold_8bit).float()
+            )
+            stats["frac_removed_saturation"] = frac(
+                saturated_observations(observed, sm.mode, sm.threshold_8bit).float()
+            )
+        light_w = get_light_pixel_weight(config, render_pkg, "tracking")
+        if light_w is not None:
+            stats["frac_removed_light_weight"] = 1.0 - frac(light_w)
+        stats["frac_used_monogs_masks"] = frac(tracking_rgb_mask(config, viewpoint, None))
+        weight = get_loss_weight(config, render_pkg, viewpoint, "tracking")
+        stats["frac_used_tracking"] = frac(tracking_rgb_mask(config, viewpoint, weight))
+    return stats
 
 
 def get_loss_tracking_rgbd(config, image, gt_image, depth, opacity, viewpoint, pixel_weight):
@@ -247,7 +341,7 @@ def get_loss_mapping(config, render_pkg, viewpoint, initialization=False):
     if not initialization:
         image = apply_exposure_affine(config, image, viewpoint)
     depth = render_pkg["depth"]
-    weight = get_light_pixel_weight(config, render_pkg, "mapping")
+    weight = get_loss_weight(config, render_pkg, viewpoint, "mapping")
     if config["Training"]["monocular"]:
         return get_loss_mapping_rgb(config, image, gt_image, depth, viewpoint, weight)
     return get_loss_mapping_rgbd(config, image, gt_image, depth, viewpoint, weight)

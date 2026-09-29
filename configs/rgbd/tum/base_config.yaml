@@ -98,3 +98,5 @@ LightTracking:
   exposure_affine: True    # exp(a)*I + b on the prediction, in the loss space
   pixel_weight:
     enabled: False         # light-model pixel weights (docs/DECISIONS.md D15)
+  saturation_mask:
+    enabled: False         # drop saturated observations (docs/DECISIONS.md D31)

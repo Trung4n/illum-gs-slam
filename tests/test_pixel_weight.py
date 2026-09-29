@@ -13,6 +13,7 @@ def _config(pixel_weight, light_enabled=True):
             "loss_color_space": "srgb",
             "exposure_affine": True,
             "pixel_weight": pixel_weight,
+            "saturation_mask": {"enabled": False},
         },
     }
 
