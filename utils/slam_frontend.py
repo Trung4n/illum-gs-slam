@@ -301,6 +301,17 @@ class FrontEnd(mp.Process):
         # expressed relative to it (see is_keyframe). Computed from the last
         # render, i.e. one pose update before the final pose (negligible once
         # converged).
+        if self.shader is not None:
+            # Fail loudly instead of tracking on with a broken pose: a lambert
+            # run went through all 2000 frames without a single new keyframe
+            # after tracking broke down (2026-09-29, docs/DECISIONS.md D33).
+            finite = torch.isfinite(loss_tracking) & torch.isfinite(viewpoint.R).all()
+            finite = finite & torch.isfinite(viewpoint.T).all()
+            if not bool(finite):
+                raise RuntimeError(
+                    f"Tracking gave a non-finite loss or pose at frame {cur_frame_idx} "
+                    "with the light model enabled"
+                )
         self.median_depth = get_median_depth(depth, opacity)
         # Fraction of pixels removed by the extension masks (saturation,
         # n . l), from the last tracking render; CSV only, and only when

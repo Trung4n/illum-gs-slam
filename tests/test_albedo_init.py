@@ -140,3 +140,20 @@ def test_observed_undoes_affine_in_linear_loss_space():
     albedo = _call(_config(space="linear", affine=True), vp)
     reobserved = torch.exp(vp.exposure_a) * albedo + vp.exposure_b
     torch.testing.assert_close(reobserved, sRGB2Linear(vp.original_image.cuda()))
+
+
+def test_rendered_depth_on_empty_map_ignores_placement_noise(monkeypatch):
+    # First keyframe: no rendered depth. The noisy placement depth must not
+    # be de-shaded pixel by pixel (its finite-difference normals are
+    # meaningless, D33): same result as the median plane.
+    import light_models.albedo_init as ai
+
+    shader = _colocated_shader()
+    cam = SimpleNamespace(fx=40.0, fy=40.0, cx=4.5, cy=2.5, original_image=torch.zeros(3, H, W))
+    rng = np.random.default_rng(1)
+    placement = (2.0 + rng.normal(0.0, 0.3, (H, W))).astype(np.float32)
+    monkeypatch.setattr(ai, "observed_radiance_linear", lambda config, vp: torch.ones(3, H, W))
+    params = {"min_shading": 0.05}
+    got = ai._rendered_depth(params, None, cam, placement, shader=shader, render_keyframe=lambda: None)
+    expected = ai._median_depth(params, None, cam, placement, shader=shader, render_keyframe=None)
+    torch.testing.assert_close(got, expected)

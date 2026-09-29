@@ -93,23 +93,33 @@ def _placement_depth_tensor(placement_depth):
     return torch.from_numpy(placement_depth.astype("float32"))
 
 
-def _median_depth(params, config, viewpoint, placement_depth, *, shader, render_keyframe):
-    # Shading of a fronto-parallel plane at the median placement depth: one
-    # scalar depth, so the per-pixel noise of a guessed depth does not enter
-    # the albedo, but its overall scale still does.
+def _median_plane(placement_depth, strategy):
+    # Fronto-parallel plane at the median of the placement depth. For
+    # monocular, the placement depth is a GUESS with noise added on purpose
+    # (FrontEnd.add_new_keyframe) so the new Gaussians spread out; that noise
+    # is not a measurement and must not enter the de-shading: finite
+    # differences of it give meaningless normals, n . l ~ 0, shading ~ c and
+    # an albedo inflated by 1/c (seen on keyframe 0 of a lambert run,
+    # 2026-09-29, docs/DECISIONS.md D33). Only its scale is kept.
     z = _placement_depth_tensor(placement_depth)
     known = z > 0
     if not known.any():
-        raise ValueError("init_albedo median_depth: the placement depth has no valid pixel")
-    plane = torch.full_like(z, float(z[known].median()))
+        raise ValueError(f"init_albedo {strategy}: the placement depth has no valid pixel")
+    return torch.full_like(z, float(z[known].median()))
+
+
+def _median_depth(params, config, viewpoint, placement_depth, *, shader, render_keyframe):
+    # Shading of the median plane (see _median_plane) everywhere.
+    plane = _median_plane(placement_depth, "median_depth")
     return _deshade(params, config, viewpoint, plane, shader)
 
 
 def _rendered_depth(params, config, viewpoint, placement_depth, *, shader, render_keyframe):
     # Depth rendered from the current map where it is trusted (opacity >=
-    # Light.gbuffer.opacity_thr, D5), the placement depth elsewhere (always
-    # the case on the first keyframe, whose map is empty).
-    z = _placement_depth_tensor(placement_depth)
+    # Light.gbuffer.opacity_thr, D5), the median plane elsewhere (always the
+    # case on the first keyframe, whose map is empty). Never the noisy
+    # placement depth itself (see _median_plane).
+    z = _median_plane(placement_depth, "rendered_depth")
     pkg = render_keyframe()
     if pkg is not None:
         thr = require_key(

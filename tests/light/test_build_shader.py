@@ -157,3 +157,21 @@ def test_saturation_configs_resolve(monkeypatch, name, light_enabled):
     # The three runs must use the same threshold to be comparable.
     base = read_light_tracking(load_config("configs/light/baseline_satmask.yaml"))
     assert sm.threshold_8bit == base.saturation_mask.threshold_8bit
+
+
+@pytest.mark.parametrize(
+    "name, light_enabled",
+    [
+        ("configs/light/4_3_nocos_sat.yaml", True),
+        ("configs/light/baseline_satmask_noaffine.yaml", False),
+    ],
+)
+def test_step_4_3_configs(monkeypatch, name, light_enabled):
+    from light_models import read_light_tracking
+    from utils.config_utils import load_config
+
+    monkeypatch.chdir(REPO)
+    cfg = load_config(name)
+    lt = read_light_tracking(cfg)
+    assert cfg["Light"]["enabled"] is light_enabled
+    assert lt.exposure_affine is False and lt.saturation_mask.enabled is True
