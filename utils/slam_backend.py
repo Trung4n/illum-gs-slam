@@ -126,7 +126,13 @@ class BackEnd(mp.Process):
             "hybrid",
         )
 
+    def report_keyframe_count(self):
+        # Light-model warm-up state (D43): keyframes in the map so far.
+        if self.shader is not None:
+            self.shader.set_keyframe_count(len(self.viewpoints))
+
     def add_next_kf(self, frame_idx, viewpoint, init=False, scale=2.0, depth_map=None):
+        self.report_keyframe_count()
         # Adds new Gaussians for a keyframe: back-projects depth_map (prepared
         # by FrontEnd.add_new_keyframe) with the keyframe's pose, randomly
         # downsampled (pcd_downsample_init if init, else pcd_downsample), and
@@ -206,6 +212,7 @@ class BackEnd(mp.Process):
             self.backend_queue.get()
 
     def initialize_map(self, cur_frame_idx, viewpoint):
+        self.report_keyframe_count()
         # Builds the initial map from ONE frame: plain 3DGS-style optimization
         # of the Gaussians only (the frame is fixed at its GT pose and its
         # exposure is not used, see initialization=True), for init_itr_num
@@ -278,6 +285,7 @@ class BackEnd(mp.Process):
         return render_pkg
 
     def map(self, current_window, prune=False, iters=1):
+        self.report_keyframe_count()
         # Joint optimization of the map and the window's keyframes.
         #
         # prune=False: `iters` optimization steps (Gaussians, poses of the

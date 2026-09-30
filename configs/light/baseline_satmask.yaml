@@ -10,6 +10,6 @@ LightTracking:
     mode: pixel
     # Compared with the observed image's 8-bit codes. Starting value = the
     # --sat threshold of Replica/scripts/physics_check/check_physics.py
-    # (also Verify.layer1.saturation_8bit, D16). TO CONFIRM.
+    # (also Verify.layer1.saturation_8bit, D16). Confirmed 2026-09-30 (D44).
     threshold_8bit: 250
     apply_to: [tracking, mapping]

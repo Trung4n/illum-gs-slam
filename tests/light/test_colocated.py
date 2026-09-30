@@ -111,7 +111,7 @@ def _interior(common):
 def test_lambert_with_given_normals_matches_oracle():
     common = _common()
     z, P, n, albedo, cam = _scene(common)
-    shader = build_shader(_config({"type": "lambert", "normal_source": {"type": "gbuffer"}}), PARAMS)
+    shader = build_shader(_config({"type": "lambert", "normal_source": {"type": "gbuffer"}, "warmup_keyframes": 0}), PARAMS)
     out = shader(_gbuffer(z, albedo, n), cam)["radiance_linear"].permute(1, 2, 0).numpy()
     expected = _oracle(common, P, n, albedo)
     m = _interior(common)
@@ -121,7 +121,7 @@ def test_lambert_with_given_normals_matches_oracle():
 def test_lambert_depth_fd_matches_oracle_normals():
     common = _common()
     z, P, n, albedo, cam = _scene(common)
-    shader = build_shader(_config({"type": "lambert", "normal_source": {"type": "depth_fd", "stencil_px": 1}}), PARAMS)
+    shader = build_shader(_config({"type": "lambert", "normal_source": {"type": "depth_fd", "stencil_px": 1}, "warmup_keyframes": 0}), PARAMS)
     out = shader(_gbuffer(z, albedo), cam)
     expected = _oracle(common, P, n, albedo)
     m = _interior(common)
@@ -185,7 +185,7 @@ def test_additive_and_none_ambient_forms():
 def test_gradient_reaches_depth_and_albedo():
     common = _common()
     z, P, n, albedo, cam = _scene(common)
-    shader = build_shader(_config({"type": "lambert", "normal_source": {"type": "depth_fd", "stencil_px": 1}}), PARAMS)
+    shader = build_shader(_config({"type": "lambert", "normal_source": {"type": "depth_fd", "stencil_px": 1}, "warmup_keyframes": 0}), PARAMS)
     g = _gbuffer(z, albedo)
     g["depth"] = g["depth"].clone().requires_grad_(True)
     g["albedo"] = g["albedo"].clone().requires_grad_(True)
@@ -195,7 +195,7 @@ def test_gradient_reaches_depth_and_albedo():
 
 
 def test_shader_pickles():
-    shader = build_shader(_config({"type": "lambert", "normal_source": {"type": "depth_fd", "stencil_px": 1}}), PARAMS)
+    shader = build_shader(_config({"type": "lambert", "normal_source": {"type": "depth_fd", "stencil_px": 1}, "warmup_keyframes": 0}), PARAMS)
     pickle.loads(pickle.dumps(shader))
 
 
@@ -205,8 +205,10 @@ def test_shader_pickles():
         ({"falloff": {"type": "learned"}}, NotImplementedError),
         ({"angular": {"type": "smoothstep"}}, NotImplementedError),
         ({"angular": {"type": "cone"}}, ValueError),
-        ({"cosine": {"type": "lambert"}}, KeyError),  # normal_source missing
-        ({"cosine": {"type": "lambert", "normal_source": {"type": "shortest_axis"}}}, NotImplementedError),
+        ({"cosine": {"type": "lambert", "warmup_keyframes": 0}}, KeyError),  # normal_source missing
+        ({"cosine": {"type": "lambert", "normal_source": {"type": "gbuffer"}}}, KeyError),  # warmup missing
+        ({"cosine": {"type": "lambert", "normal_source": {"type": "gbuffer"}, "warmup_keyframes": -1}}, ValueError),
+        ({"cosine": {"type": "lambert", "normal_source": {"type": "shortest_axis"}, "warmup_keyframes": 0}}, NotImplementedError),
         ({"ambient": {"type": "multiplicative_const"}}, KeyError),  # c missing
         ({"ambient": {"type": "none", "c": _p("ambient.c_config")}}, ValueError),
         ({"gbuffer": {"opacity_thr": 0}}, ValueError),
@@ -244,3 +246,25 @@ def test_pixel_offset_is_required():
     del g["pixel_offset"]
     with pytest.raises(KeyError):
         shader(g, cam)
+
+
+def test_lambert_warmup_behaves_like_no_cosine():
+    # During the warm-up the lambert shader must equal the no-cosine one and
+    # emit no n . l map (so pixel_weight does not apply); after it, n . l.
+    common = _common()
+    z, P, n, albedo, cam = _scene(common)
+    lam_cfg = {"type": "lambert", "normal_source": {"type": "depth_fd", "stencil_px": 1},
+               "warmup_keyframes": 3}
+    lam = build_shader(_config(lam_cfg), PARAMS)
+    none = build_shader(_config({"type": "none"}), PARAMS)
+    g = _gbuffer(z, albedo)
+    lam.set_keyframe_count(3)
+    out = lam(g, cam)
+    torch.testing.assert_close(out["radiance_linear"], none(g, cam)["radiance_linear"])
+    assert "light_cos_nl" not in out and "light_cosine_warmup" in out
+    lam.set_keyframe_count(4)
+    out = lam(g, cam)
+    assert "light_cos_nl" in out and "light_cosine_warmup" not in out
+    m = _interior(common)
+    got = out["radiance_linear"].permute(1, 2, 0).numpy()
+    np.testing.assert_allclose(got[m], _oracle(common, P, n, albedo)[m], rtol=1e-5, atol=1e-7)

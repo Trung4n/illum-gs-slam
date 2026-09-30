@@ -224,6 +224,9 @@ class FrontEnd(mp.Process):
         # Initial guess = previous frame's pose (no motion model).
         prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
         viewpoint.update_RT(prev.R, prev.T)
+        if self.shader is not None:
+            # Light-model warm-up state (D43): keyframes in the map so far.
+            self.shader.set_keyframe_count(len(self.kf_indices))
 
         # Only this camera's pose delta and exposure are optimized. The map
         # snapshot in self.gaussians is detached (clone_obj), so no gradient
@@ -316,9 +319,11 @@ class FrontEnd(mp.Process):
         # Fraction of pixels removed by the extension masks (saturation,
         # n . l), from the last tracking render; CSV only, and only when
         # such a mask is enabled (light_models/diagnostics.py).
-        log_pixel_usage(
-            self.save_dir, cur_frame_idx, pixel_usage_stats(self.config, render_pkg, viewpoint)
-        )
+        usage = pixel_usage_stats(self.config, render_pkg, viewpoint)
+        log_pixel_usage(self.save_dir, cur_frame_idx, usage)
+        if usage is not None and usage["frac_used_tracking"] == 0.0:
+            # Nothing left for the tracking loss: the pose cannot move (D43).
+            Log(f"frame {cur_frame_idx}: the tracking loss uses no pixel", tag="Light")
         return render_pkg
 
     def is_keyframe(

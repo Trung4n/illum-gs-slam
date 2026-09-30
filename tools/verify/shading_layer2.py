@@ -93,7 +93,8 @@ def check_frame(config, params, frame_dir, uid, device):
     variants = {}
     stencils = require_key(config["Verify"]["layer2"], "depth_fd_stencils", "Verify.layer2")
     cosines = [("nocos", {"type": "none"})] + [
-        (f"depth_fd_k{k}", {"type": "lambert", "normal_source": {"type": "depth_fd", "stencil_px": k}})
+        (f"depth_fd_k{k}", {"type": "lambert", "warmup_keyframes": 0,
+                            "normal_source": {"type": "depth_fd", "stencil_px": k}})
         for k in stencils
     ]
     for name, cosine in cosines:

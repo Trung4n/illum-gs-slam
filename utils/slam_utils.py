@@ -71,6 +71,9 @@ def get_light_pixel_weight(config, render_pkg, target):
     pw = read_light_tracking(config).pixel_weight
     if not pw.enabled or target not in pw.apply_to:
         return None
+    if "light_cosine_warmup" in render_pkg:
+        # Lambert warm-up (D43): no n . l yet, so no n . l weight.
+        return None
     if "light_cos_nl" not in render_pkg:
         raise KeyError(
             "LightTracking.pixel_weight.min_cos_nl needs n . l from the shader "

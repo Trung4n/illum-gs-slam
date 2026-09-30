@@ -83,6 +83,11 @@ class ColocatedShader:
             raise ValueError(f"Light.gbuffer: unexpected keys {sorted(extra)}")
         self.opacity_thr = float(thr)
 
+    def set_keyframe_count(self, n):
+        # Keyframes currently in the map, reported by FrontEnd / BackEnd
+        # before each step; only components with a warm-up use it (D43).
+        self.cosine.set_keyframe_count(n)
+
     def __call__(self, gbuffer, viewpoint_camera):
         albedo = gbuffer["albedo"]
         points, valid = surface_points(gbuffer, viewpoint_camera, self.opacity_thr)

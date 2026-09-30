@@ -29,6 +29,9 @@ class IdentityShader:
     def __call__(self, gbuffer, viewpoint_camera):
         return {"radiance_linear": gbuffer["albedo"]}
 
+    def set_keyframe_count(self, n):
+        pass
+
 
 def _make_identity(light_cfg, load_params):
     return IdentityShader()

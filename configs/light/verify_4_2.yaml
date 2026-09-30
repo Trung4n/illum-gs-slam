@@ -24,6 +24,8 @@ Light:
     # Layer 1 feeds ground-truth normals through the G-buffer; the script
     # also runs a depth_fd variant on the ground-truth depth.
     normal_source: {type: gbuffer}
+    # Verification: always the full model.
+    warmup_keyframes: 0
   ambient:
     type: multiplicative_const
     c: {source: params_file, key: ambient.c_config, learnable: false}

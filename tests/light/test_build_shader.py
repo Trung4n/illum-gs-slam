@@ -199,6 +199,6 @@ def test_lambert_stencil_configs(monkeypatch, k):
 
     monkeypatch.chdir(REPO)
     cfg = load_config(f"configs/light/4_3_lambert_sat_k{k}.yaml")
-    assert cfg["Light"]["cosine"] == {"type": "lambert",
+    assert cfg["Light"]["cosine"] == {"type": "lambert", "warmup_keyframes": 10,
                                       "normal_source": {"type": "depth_fd", "stencil_px": k}}
     assert cfg["LightTracking"]["exposure_affine"] is False

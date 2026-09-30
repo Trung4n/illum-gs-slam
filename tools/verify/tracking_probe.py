@@ -159,6 +159,9 @@ def main(argv=None):
             fe.gaussians = gaussians
             fe.use_every_n_frames = off
             fe.cameras = {ref: ref_cam}
+            # The probe map stands for a converged map: past any light-model
+            # warm-up (D43), whatever the experiment config sets.
+            fe.kf_indices = list(range(10 ** 6))
             view = Camera.init_from_dataset(dataset, tgt, proj)
             view.compute_grad_mask(config)
             gt = c2w_gt(view)

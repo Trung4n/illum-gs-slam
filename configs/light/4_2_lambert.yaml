@@ -8,6 +8,12 @@ Light:
     type: lambert
     # stencil_px 1 = the original 1-pixel central differences (D40).
     normal_source: {type: depth_fd, stencil_px: 1}
+    # n . l is used only once the map holds MORE than this many keyframes
+    # (D43): before, the monocular geometry comes from guessed depths and
+    # its normals removed nearly every tracking pixel. Starting value =
+    # Training.window_size, when monocular initialization completes (its
+    # initial BA). Confirmed 2026-09-30 (D44).
+    warmup_keyframes: 10
 
 LightTracking:
   pixel_weight:

@@ -6,6 +6,6 @@ LightTracking:
   saturation_mask:
     enabled: True
     mode: pixel
-    # Same value as baseline_satmask.yaml (keep them equal). TO CONFIRM.
+    # Same value as baseline_satmask.yaml (keep them equal). Confirmed 2026-09-30 (D44).
     threshold_8bit: 250
     apply_to: [tracking, mapping]

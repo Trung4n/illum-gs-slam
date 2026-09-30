@@ -44,3 +44,9 @@ def test_needs_lambert_output():
     cfg = _config({"enabled": True, "apply_to": ["tracking"], "min_cos_nl": 0.3})
     with pytest.raises(KeyError, match="lambert"):
         get_light_pixel_weight(cfg, {}, "tracking")
+
+
+def test_no_weight_during_lambert_warmup():
+    cfg = _config({"enabled": True, "apply_to": ["tracking"], "min_cos_nl": 0.3})
+    pkg = {"light_cosine_warmup": torch.ones(1, 2, 2, dtype=torch.bool)}
+    assert get_light_pixel_weight(cfg, pkg, "tracking") is None

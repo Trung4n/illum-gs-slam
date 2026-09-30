@@ -72,6 +72,12 @@ def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
 
 
 def eval_ate(frames, kf_ids, save_dir, iterations, final=False, monocular=False):
+    if len(kf_ids) < 3:
+        # Sim(3)/SE(3) alignment needs at least 3 positions; with fewer the run
+        # failed (e.g. tracking never moved, D43). Report instead of raising,
+        # so the rest of the end-of-run log is still printed.
+        Log(f"ATE not computed: only {len(kf_ids)} keyframe(s)", tag="Eval")
+        return float("nan")
     trj_data = dict()
     latest_frame_idx = kf_ids[-1] + 2 if final else kf_ids[-1] + 1
     trj_id, trj_est, trj_gt = [], [], []
