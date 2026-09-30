@@ -134,6 +134,7 @@ def test_every_root_config_states_baseline_explicitly(path):
         "exposure_affine": True,
         "pixel_weight": {"enabled": False},
         "saturation_mask": {"enabled": False},
+        "min_gradient": {"enabled": False},
     }, path
 
 
@@ -175,3 +176,16 @@ def test_step_4_3_configs(monkeypatch, name, light_enabled):
     lt = read_light_tracking(cfg)
     assert cfg["Light"]["enabled"] is light_enabled
     assert lt.exposure_affine is False and lt.saturation_mask.enabled is True
+
+
+def test_min_gradient_configs(monkeypatch):
+    from light_models import read_min_gradient
+    from utils.config_utils import load_config
+
+    monkeypatch.chdir(REPO)
+    base = read_min_gradient(load_config("configs/light/baseline_satmask_mingrad.yaml"))
+    light = read_min_gradient(load_config("configs/light/4_3_nocos_sat_mingrad.yaml"))
+    assert base.enabled and light.enabled
+    # The two runs must use the same floor to be comparable.
+    assert base.threshold_8bit == light.threshold_8bit
+    assert load_config("configs/light/4_3_nocos_sat_mingrad.yaml")["Light"]["enabled"] is True

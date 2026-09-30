@@ -6,6 +6,12 @@ Results:
   use_gui: True
   eval_rendering: False
   use_wandb: False
+  # Keyframe trajectory analysis printed at the end of each run
+  # (utils/trajectory_analysis.py): sliding-window size for the local
+  # Sim(3) and frames per reporting range. Logging only.
+  trajectory_analysis:
+    window_kf: 30
+    range_step_frames: 250
 
 Dataset:
   dataset_path: datasets/realsense/rgbd
@@ -97,3 +103,5 @@ LightTracking:
     enabled: False         # light-model pixel weights (docs/DECISIONS.md D15)
   saturation_mask:
     enabled: False         # drop saturated observations (docs/DECISIONS.md D31)
+  min_gradient:
+    enabled: False         # absolute gradient floor for tracking pixels (D37)

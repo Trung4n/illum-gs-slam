@@ -2,6 +2,7 @@ import torch
 from torch import nn
 
 from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2, getWorld2View2
+from light_models import read_min_gradient
 from utils.slam_utils import image_gradient, image_gradient_mask
 
 
@@ -222,6 +223,15 @@ class Camera(nn.Module):
             median_img_grad_intensity = img_grad_intensity.median()
             self.grad_mask = (
                 img_grad_intensity > median_img_grad_intensity * edge_threshold
+            )
+
+        # Optional absolute floor on the gradient (LightTracking.min_gradient,
+        # docs/DECISIONS.md D37): the relative thresholds above select noise
+        # below one gray level in dark regions. Disabled = original MonoGS.
+        min_gradient = read_min_gradient(config)
+        if min_gradient.enabled:
+            self.grad_mask = self.grad_mask & (
+                img_grad_intensity * 255.0 >= min_gradient.threshold_8bit
             )
 
     def clean(self):

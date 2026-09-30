@@ -1,5 +1,6 @@
 import os
 import shutil
+import subprocess
 import sys
 import time
 from argparse import ArgumentParser
@@ -14,13 +15,14 @@ import wandb
 from gaussian_splatting.scene.gaussian_model import GaussianModel
 from gaussian_splatting.utils.system_utils import mkdir_p
 from gui import gui_utils, slam_gui
-from light_models import build_shader, read_light_tracking
+from light_models import build_shader, read_light_tracking, read_min_gradient
 from light_models.albedo_init import get_albedo_init
 from light_models.params import params_file_path
-from utils.config_utils import load_config
+from utils.config_utils import load_config, require_key
 from utils.dataset import load_dataset
 from utils.eval_utils import eval_ate, eval_rendering, save_gaussians
 from utils.logging_utils import Log
+from utils.trajectory_analysis import run_report
 from utils.multiprocessing_utils import FakeQueue
 from utils.slam_backend import BackEnd
 from utils.slam_frontend import FrontEnd
@@ -55,6 +57,7 @@ class SLAM:
         # Parsed here only to fail fast on a bad LightTracking block; the
         # losses re-read it from the config (utils/slam_utils.py).
         read_light_tracking(self.config)
+        read_min_gradient(self.config)
         if self.shader is not None:
             # Same fail-fast for the albedo init strategy (resolved again
             # by the backend for each keyframe, see BackEnd.add_next_kf).
@@ -68,6 +71,12 @@ class SLAM:
                     os.path.join(save_dir, "light_params.json"),
                 )
         self.use_gui = self.config["Results"]["use_gui"]
+        # Read at startup so a missing key fails before the run, not after.
+        self.trajectory_analysis = require_key(
+            self.config["Results"], "trajectory_analysis", "Results"
+        )
+        for key in ("window_kf", "range_step_frames"):
+            require_key(self.trajectory_analysis, key, "Results.trajectory_analysis")
         if self.live_mode:
             # live demo always needs the viewer to monitor tracking quality
             self.use_gui = True
@@ -83,6 +92,10 @@ class SLAM:
         self.gaussians = GaussianModel(model_params.sh_degree, config=self.config)
         self.gaussians.init_lr(6.0)  # spatial_lr_scale, scales the xyz/scaling learning rates
         self.dataset = load_dataset(model_params, model_params.source_path, config=config)
+        if "max_frames" in config["Dataset"]:
+            # Set only by --max_frames (quick diagnostic runs); absent = the
+            # whole sequence, as in original MonoGS.
+            self.dataset.num_imgs = min(self.dataset.num_imgs, config["Dataset"]["max_frames"])
 
         self.gaussians.training_setup(opt_params)
         # Rasterizer background color, read strictly from the config (no
@@ -165,6 +178,26 @@ class SLAM:
             shader=self.shader,
         )
 
+    def log_trajectory_analysis(self):
+        # Prints the decomposition of the final keyframe trajectory error
+        # (utils/trajectory_analysis.py) into the log, so it survives even if
+        # the result folder is lost (Kaggle sessions). Diagnostics only: a
+        # failure here must not cost the rest of the run's outputs.
+        if self.save_dir is None:
+            return
+        if not os.path.isfile(os.path.join(self.save_dir, "plot", "trj_final.json")):
+            return
+        try:
+            lines = run_report(
+                self.save_dir,
+                self.trajectory_analysis["window_kf"],
+                self.trajectory_analysis["range_step_frames"],
+            )
+        except Exception as exc:  # noqa: BLE001 - logged, run continues
+            lines = [f"trajectory analysis failed: {exc!r}"]
+        for line in lines:
+            Log(line, tag="Eval")
+
     def run(self):
         # CUDA events used to time the whole run (start..end) for the FPS report below.
         start = torch.cuda.Event(enable_timing=True)
@@ -196,6 +229,7 @@ class SLAM:
         FPS = N_frames / (start.elapsed_time(end) * 0.001)
         Log("Total time", start.elapsed_time(end) * 0.001, tag="Eval")
         Log("Total FPS", N_frames / (start.elapsed_time(end) * 0.001), tag="Eval")
+        self.log_trajectory_analysis()
 
         if self.eval_rendering:
             # Snapshot the map/trajectory as produced live by tracking, before any
@@ -281,6 +315,26 @@ class SLAM:
             Log("GUI Stopped and joined the main thread")
 
 
+def save_git_state(save_dir):
+    # Commit hash, plus the uncommitted diff if any (CLAUDE.md section 10).
+    # Never fails the run: without git the reason is written instead.
+    repo = os.path.dirname(os.path.abspath(__file__))
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
+        ).stdout.strip()
+        diff = subprocess.run(
+            ["git", "diff", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as e:
+        commit, diff = f"unknown ({e})", ""
+    with open(os.path.join(save_dir, "git_commit.txt"), "w") as f:
+        f.write(commit + "\n")
+    if diff:
+        with open(os.path.join(save_dir, "git_diff.patch"), "w") as f:
+            f.write(diff)
+
+
 if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
@@ -291,6 +345,13 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Override Dataset.dataset_path from the config file",
+    )
+    parser.add_argument(
+        "--max_frames",
+        type=int,
+        default=None,
+        help="Process only the first N frames (quick diagnostic runs). Recorded "
+        "as Dataset.max_frames in the run's config.yml; omitted = whole sequence",
     )
 
     args = parser.parse_args(sys.argv[1:])
@@ -303,6 +364,10 @@ if __name__ == "__main__":
     config = load_config(args.config)
     if args.dataset_path is not None:
         config["Dataset"]["dataset_path"] = args.dataset_path
+    if args.max_frames is not None:
+        if args.max_frames <= 0:
+            raise ValueError(f"--max_frames must be > 0, got {args.max_frames}")
+        config["Dataset"]["max_frames"] = args.max_frames
     save_dir = None
 
     if args.eval:
@@ -322,8 +387,14 @@ if __name__ == "__main__":
         current_datetime = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
         dataset_path = os.path.normpath(config["Dataset"]["dataset_path"])
         path = dataset_path.split(os.sep)
+        # results/<experiment>/<time>/ (CLAUDE.md section 10): the experiment
+        # is the config file name plus the dataset it ran on, so runs of
+        # different configs no longer share one folder.
+        experiment = os.path.splitext(os.path.basename(args.config))[0]
         save_dir = os.path.join(
-            config["Results"]["save_dir"], path[-2] + "_" + path[-1], current_datetime
+            config["Results"]["save_dir"],
+            experiment + "__" + path[-2] + "_" + path[-1],
+            current_datetime,
         )
         tmp = args.config
         tmp = tmp.split(".")[0]
@@ -331,6 +402,7 @@ if __name__ == "__main__":
         mkdir_p(save_dir)
         with open(os.path.join(save_dir, "config.yml"), "w") as file:
             documents = yaml.dump(config, file)
+        save_git_state(save_dir)
         Log("saving results in " + save_dir)
         run = wandb.init(
             project="MonoGS",

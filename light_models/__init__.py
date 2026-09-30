@@ -209,3 +209,35 @@ def _read_saturation_mask(block):
             f"{PIXEL_WEIGHT_TARGETS}, got {apply_to!r}"
         )
     return SimpleNamespace(enabled=True, mode=mode, threshold_8bit=thr, apply_to=tuple(apply_to))
+
+
+def read_min_gradient(config):
+    """LightTracking.min_gradient: {enabled: false} or
+    {enabled: true, threshold_8bit: <number > 0>} (docs/DECISIONS.md D37).
+
+    An ABSOLUTE floor on the image gradient of the pixels MonoGS's tracking
+    keeps (Camera.compute_grad_mask), in 8-bit gray levels per pixel, gray =
+    mean of R, G, B as MonoGS computes it. MonoGS only thresholds relative to
+    each 32x32 cell's median gradient; in the dark regions of the lit data
+    that median is ~0 and JPEG/quantization noise below one gray level gets
+    selected. Observation only, so it also applies with Light.enabled: false.
+    Read separately from read_light_tracking: it concerns the tracking pixel
+    selection, not the loss.
+    """
+    block = require_key(config, "LightTracking", "")
+    where = "LightTracking.min_gradient"
+    mg = require_key(block, "min_gradient", "LightTracking")
+    if not isinstance(mg, dict):
+        raise TypeError(f"{where} must be a block, got {mg!r}")
+    unknown = set(mg) - {"enabled", "threshold_8bit"}
+    if unknown:
+        raise ValueError(f"{where}: unexpected keys {sorted(unknown)}")
+    enabled = require_key(mg, "enabled", where)
+    if not isinstance(enabled, bool):
+        raise TypeError(f"{where}.enabled must be true or false, got {enabled!r}")
+    if not enabled:
+        return SimpleNamespace(enabled=False, threshold_8bit=None)
+    thr = require_key(mg, "threshold_8bit", where)
+    if isinstance(thr, bool) or not isinstance(thr, (int, float)) or thr <= 0:
+        raise ValueError(f"{where}.threshold_8bit must be a number > 0, got {thr!r}")
+    return SimpleNamespace(enabled=True, threshold_8bit=float(thr))
