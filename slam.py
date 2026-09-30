@@ -17,6 +17,7 @@ from gaussian_splatting.utils.system_utils import mkdir_p
 from gui import gui_utils, slam_gui
 from light_models import build_shader, read_light_tracking, read_min_gradient
 from light_models.albedo_init import get_albedo_init
+from light_models.diagnostics import summarize_csv_logs
 from light_models.params import params_file_path
 from utils.config_utils import load_config, require_key
 from utils.dataset import load_dataset
@@ -195,6 +196,10 @@ class SLAM:
             )
         except Exception as exc:  # noqa: BLE001 - logged, run continues
             lines = [f"trajectory analysis failed: {exc!r}"]
+        try:
+            lines += summarize_csv_logs(self.save_dir)
+        except Exception as exc:  # noqa: BLE001 - logged, run continues
+            lines.append(f"CSV log summary failed: {exc!r}")
         for line in lines:
             Log(line, tag="Eval")
 

@@ -143,6 +143,48 @@ def log_pixel_usage(save_dir, frame_idx, stats):
         f.write(",".join(_format(row.get(c)) for c in _PIXEL_USAGE_COLUMNS) + "\n")
 
 
+def summarize_csv_logs(save_dir):
+    """End-of-run summary of the per-frame / per-keyframe CSVs of this module,
+    as text lines printed into the log (so the numbers survive when the
+    result folder is lost, e.g. a Kaggle session). Missing files are skipped.
+    Pure reading; never used by tracking or mapping."""
+    import csv
+
+    lines = []
+
+    def rows(name):
+        path = os.path.join(save_dir, name)
+        if not os.path.isfile(path):
+            return []
+        with open(path, "r", encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+
+    def quantiles(values):
+        v = sorted(values)
+        pick = lambda q: v[min(len(v) - 1, int(q * (len(v) - 1) + 0.5))]  # noqa: E731
+        return f"p5 {pick(0.05):.4f}  median {pick(0.5):.4f}  p95 {pick(0.95):.4f}"
+
+    usage = rows(PIXEL_USAGE_CSV_NAME)
+    if usage:
+        lines.append(f"pixel usage over {len(usage)} tracked frames:")
+        for col in _PIXEL_USAGE_COLUMNS[1:]:
+            vals = [float(r[col]) for r in usage if r.get(col)]
+            if vals:
+                lines.append(f"  {col:26s} {quantiles(vals)}")
+    expo = [r for r in rows(EXPOSURE_CSV_NAME) if r["stage"] == "map"]
+    if expo:
+        gains = [float(r["gain_exp_a"]) for r in expo]
+        lines.append(f"exposure gain exp(a) over {len(expo)} keyframes: {quantiles(gains)}")
+    albedo = [r for r in rows(CSV_NAME) if r["stage"] == "map" and r.get("mean")]
+    if albedo:
+        last = albedo[-1]
+        lines.append(
+            f"albedo, map after the last keyframe {last['frame_idx']}: mean {float(last['mean']):.3f}, "
+            f"max {float(last['max']):.2f}, fraction > 1 {float(last['frac_any_gt1']):.1%}"
+        )
+    return lines
+
+
 def _format(value):
     if value is None:
         return ""
