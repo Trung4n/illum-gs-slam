@@ -202,3 +202,17 @@ def test_lambert_stencil_configs(monkeypatch, k):
     assert cfg["Light"]["cosine"] == {"type": "lambert", "warmup_keyframes": 10,
                                       "normal_source": {"type": "depth_fd", "stencil_px": k}}
     assert cfg["LightTracking"]["exposure_affine"] is False
+
+
+def test_lambert_opacity_and_weight_ablations(monkeypatch):
+    from light_models import build_shader as _build, read_light_tracking
+    from utils.config_utils import load_config
+
+    monkeypatch.chdir(REPO)
+    op = load_config("configs/light/4_3_lambert_sat_op05.yaml")
+    mw = load_config("configs/light/4_3_lambert_sat_op05_mapw.yaml")
+    assert op["Light"]["gbuffer"]["opacity_thr"] == 0.5
+    assert mw["Light"]["gbuffer"]["opacity_thr"] == 0.5
+    assert read_light_tracking(op).pixel_weight.apply_to == ("tracking", "mapping")
+    assert read_light_tracking(mw).pixel_weight.apply_to == ("mapping",)
+    assert read_light_tracking(mw).exposure_affine is False

@@ -304,6 +304,16 @@ def pixel_usage_stats(config, render_pkg, viewpoint):
             stats["frac_light_valid"] = float(render_pkg["light_valid"].float().mean())
         if "light_normal_valid" in render_pkg:
             stats["frac_normal_valid"] = float(render_pkg["light_normal_valid"].float().mean())
+            if pw.enabled:
+                # Valid normal but n . l below the threshold: the other reason
+                # (besides invalid normals) for the light weight to drop a pixel.
+                low = render_pkg["light_normal_valid"] & (render_pkg["light_cos_nl"] < pw.min_cos_nl)
+                stats["frac_cos_below_min"] = float(low.float().mean())
+        # Rendered accumulated opacity: how opaque the SLAM map is (D45); the
+        # G-buffer trusts a pixel's depth only above Light.gbuffer.opacity_thr.
+        op = render_pkg["opacity"].detach().flatten().float()
+        stats["opacity_p10"] = float(op.quantile(0.1))
+        stats["opacity_median"] = float(op.median())
         stats["frac_used_monogs_masks"] = frac(tracking_rgb_mask(config, viewpoint, None))
         weight = get_loss_weight(config, render_pkg, viewpoint, "tracking")
         stats["frac_used_tracking"] = frac(tracking_rgb_mask(config, viewpoint, weight))
