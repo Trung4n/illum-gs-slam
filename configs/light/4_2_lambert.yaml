@@ -6,7 +6,8 @@ inherit_from: "configs/light/4_2_nocos.yaml"
 Light:
   cosine:
     type: lambert
-    normal_source: depth_fd
+    # stencil_px 1 = the original 1-pixel central differences (D40).
+    normal_source: {type: depth_fd, stencil_px: 1}
 
 LightTracking:
   pixel_weight:

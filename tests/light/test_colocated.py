@@ -111,7 +111,7 @@ def _interior(common):
 def test_lambert_with_given_normals_matches_oracle():
     common = _common()
     z, P, n, albedo, cam = _scene(common)
-    shader = build_shader(_config({"type": "lambert", "normal_source": "gbuffer"}), PARAMS)
+    shader = build_shader(_config({"type": "lambert", "normal_source": {"type": "gbuffer"}}), PARAMS)
     out = shader(_gbuffer(z, albedo, n), cam)["radiance_linear"].permute(1, 2, 0).numpy()
     expected = _oracle(common, P, n, albedo)
     m = _interior(common)
@@ -121,7 +121,7 @@ def test_lambert_with_given_normals_matches_oracle():
 def test_lambert_depth_fd_matches_oracle_normals():
     common = _common()
     z, P, n, albedo, cam = _scene(common)
-    shader = build_shader(_config({"type": "lambert", "normal_source": "depth_fd"}), PARAMS)
+    shader = build_shader(_config({"type": "lambert", "normal_source": {"type": "depth_fd", "stencil_px": 1}}), PARAMS)
     out = shader(_gbuffer(z, albedo), cam)
     expected = _oracle(common, P, n, albedo)
     m = _interior(common)
@@ -185,7 +185,7 @@ def test_additive_and_none_ambient_forms():
 def test_gradient_reaches_depth_and_albedo():
     common = _common()
     z, P, n, albedo, cam = _scene(common)
-    shader = build_shader(_config({"type": "lambert", "normal_source": "depth_fd"}), PARAMS)
+    shader = build_shader(_config({"type": "lambert", "normal_source": {"type": "depth_fd", "stencil_px": 1}}), PARAMS)
     g = _gbuffer(z, albedo)
     g["depth"] = g["depth"].clone().requires_grad_(True)
     g["albedo"] = g["albedo"].clone().requires_grad_(True)
@@ -195,7 +195,7 @@ def test_gradient_reaches_depth_and_albedo():
 
 
 def test_shader_pickles():
-    shader = build_shader(_config({"type": "lambert", "normal_source": "depth_fd"}), PARAMS)
+    shader = build_shader(_config({"type": "lambert", "normal_source": {"type": "depth_fd", "stencil_px": 1}}), PARAMS)
     pickle.loads(pickle.dumps(shader))
 
 
@@ -206,7 +206,7 @@ def test_shader_pickles():
         ({"angular": {"type": "smoothstep"}}, NotImplementedError),
         ({"angular": {"type": "cone"}}, ValueError),
         ({"cosine": {"type": "lambert"}}, KeyError),  # normal_source missing
-        ({"cosine": {"type": "lambert", "normal_source": "shortest_axis"}}, NotImplementedError),
+        ({"cosine": {"type": "lambert", "normal_source": {"type": "shortest_axis"}}}, NotImplementedError),
         ({"ambient": {"type": "multiplicative_const"}}, KeyError),  # c missing
         ({"ambient": {"type": "none", "c": _p("ambient.c_config")}}, ValueError),
         ({"gbuffer": {"opacity_thr": 0}}, ValueError),

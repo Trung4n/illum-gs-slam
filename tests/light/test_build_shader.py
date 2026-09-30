@@ -190,3 +190,15 @@ def test_min_gradient_configs(monkeypatch):
     # The two runs must use the same floor to be comparable.
     assert base.threshold_8bit == light.threshold_8bit
     assert load_config("configs/light/4_3_nocos_sat_mingrad.yaml")["Light"]["enabled"] is True
+
+
+@pytest.mark.parametrize("k", [2, 4, 8])
+def test_lambert_stencil_configs(monkeypatch, k):
+    from light_models.params import load_params_file  # noqa: F401
+    from utils.config_utils import load_config
+
+    monkeypatch.chdir(REPO)
+    cfg = load_config(f"configs/light/4_3_lambert_sat_k{k}.yaml")
+    assert cfg["Light"]["cosine"] == {"type": "lambert",
+                                      "normal_source": {"type": "depth_fd", "stencil_px": k}}
+    assert cfg["LightTracking"]["exposure_affine"] is False

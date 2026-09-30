@@ -86,8 +86,12 @@ def check_frame(config, params, frame_dir, uid, device):
         "outside": cos_th <= cos_a,
     }
     variants = {}
-    for name, cosine in (("nocos", {"type": "none"}),
-                         ("depth_fd", {"type": "lambert", "normal_source": "depth_fd"})):
+    stencils = require_key(config["Verify"]["layer2"], "depth_fd_stencils", "Verify.layer2")
+    cosines = [("nocos", {"type": "none"})] + [
+        (f"depth_fd_k{k}", {"type": "lambert", "normal_source": {"type": "depth_fd", "stencil_px": k}})
+        for k in stencils
+    ]
+    for name, cosine in cosines:
         cfg = copy.deepcopy(config)
         cfg["Light"]["cosine"] = cosine
         with torch.no_grad():

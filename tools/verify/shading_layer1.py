@@ -105,7 +105,8 @@ def selection(config, rgb8, albedo_lin, z, n_gt, cos_nl, pts):
     alb_min = require_key(v1, "albedo_min_sum_linear", "Verify.layer1")
     planar = require_key(v1, "planar_deg", "Verify.layer1")
     valid = z > 0
-    n_fd, n_fd_ok = DepthFiniteDifference()(pts, torch.from_numpy(valid), None)
+    # check_physics.py's planar test uses 1-pixel differences (common.depth_normals).
+    n_fd, n_fd_ok = DepthFiniteDifference(stencil_px=1)(pts, torch.from_numpy(valid), None)
     cos_ang = (n_fd.permute(1, 2, 0).numpy() * n_gt).sum(-1).clip(-1, 1)
     is_planar = n_fd_ok.numpy() & (np.degrees(np.arccos(cos_ang)) < planar)
     return (
@@ -147,7 +148,11 @@ def check_frame(config, params, frame_dir):
         "outside": cos_th <= cos_a,
     }
     variants = {}
-    for name, normal_source in (("gt_normals", None), ("depth_fd", "depth_fd")):
+    k = require_key(config["Verify"]["layer1"], "depth_fd_stencil_px", "Verify.layer1")
+    for name, normal_source in (
+        ("gt_normals", None),
+        ("depth_fd", {"type": "depth_fd", "stencil_px": k}),
+    ):
         cfg = copy.deepcopy(config)
         if normal_source is not None:
             cfg["Light"]["cosine"]["normal_source"] = normal_source

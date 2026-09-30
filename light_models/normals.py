@@ -6,26 +6,39 @@ import torch
 from light_models.registry import declare_planned, register
 
 
-@register("normals", "depth_fd")
+@register("normals", "depth_fd", options=("stencil_px",))
 class DepthFiniteDifference:
     """Normals from central differences of the back-projected points, i.e.
-    of the rasterized depth AFTER division by opacity (gbuffer.py, D5/D15).
-    Same construction as Replica/scripts/physics_check/common.py
-    (depth_normals): n = (P[u+1]-P[u-1]) x (P[v+1]-P[v-1]), flipped to face
-    the camera. Invalid if the pixel or one of its 4 neighbours is invalid,
-    on the image border, or if the cross product is exactly zero."""
+    of the rasterized depth AFTER division by opacity (gbuffer.py, D5/D15):
+    n = (P[u+k]-P[u-k]) x (P[v+k]-P[v-k]), k = stencil_px, flipped to face
+    the camera. k = 1 is the construction of Replica/scripts/physics_check/
+    common.py (depth_normals). A wider stencil averages out the bumps of a
+    surface made of discrete Gaussians, which make 1-pixel differences
+    unusable (layer 2 and tracking probe, docs/DECISIONS.md D40), at the cost
+    of more pixels invalid near depth edges. Invalid if the pixel or one of
+    its 4 neighbours at distance k is invalid, within k of the image border,
+    or if the cross product is exactly zero."""
+
+    def __init__(self, stencil_px):
+        if isinstance(stencil_px, bool) or not isinstance(stencil_px, int) or stencil_px < 1:
+            raise ValueError(
+                f"Light.cosine.normal_source.stencil_px must be an integer >= 1, got {stencil_px!r}"
+            )
+        self.k = stencil_px
 
     def __call__(self, points, valid, gbuffer):
-        _, h, w = points.shape
+        k = self.k
         du = torch.zeros_like(points)
         dv = torch.zeros_like(points)
-        du[:, :, 1:-1] = points[:, :, 2:] - points[:, :, :-2]
-        dv[:, 1:-1, :] = points[:, 2:, :] - points[:, :-2, :]
+        du[:, :, k:-k] = points[:, :, 2 * k:] - points[:, :, :-2 * k]
+        dv[:, k:-k, :] = points[:, 2 * k:, :] - points[:, :-2 * k, :]
         ok = valid.clone()
-        ok[:, 1:-1] &= valid[:, 2:] & valid[:, :-2]
-        ok[1:-1, :] &= valid[2:, :] & valid[:-2, :]
-        ok[[0, -1], :] = False
-        ok[:, [0, -1]] = False
+        ok[:, k:-k] &= valid[:, 2 * k:] & valid[:, :-2 * k]
+        ok[k:-k, :] &= valid[2 * k:, :] & valid[:-2 * k, :]
+        ok[:k, :] = False
+        ok[-k:, :] = False
+        ok[:, :k] = False
+        ok[:, -k:] = False
 
         n = torch.cross(du, dv, dim=0)
         norm = n.norm(dim=0)

@@ -23,7 +23,7 @@ Light:
     type: lambert
     # Layer 1 feeds ground-truth normals through the G-buffer; the script
     # also runs a depth_fd variant on the ground-truth depth.
-    normal_source: gbuffer
+    normal_source: {type: gbuffer}
   ambient:
     type: multiplicative_const
     c: {source: params_file, key: ambient.c_config, learnable: false}
@@ -40,6 +40,8 @@ Verify:
     albedo_min_sum_linear: 0.1  # --albedo-min: excluded if sum of linear albedo < this
     planar_deg: 5.0             # --planar-deg: excluded if pass normal and depth normal differ more
     core_margin_deg: 0.5        # fit_pixels(need_core): core = theta < core_half_angle - margin
+    # Stencil of the depth_fd variant on the ground-truth depth.
+    depth_fd_stencil_px: 1
     # Shadows: check_physics.py exports no shadow mask, so shadowed pixels are
     # NOT excluded (about 0.09% of the cone); median and p95 are reported.
   layer2:
@@ -48,4 +50,6 @@ Verify:
     # Opacity given to the Gaussians built from ground truth, so that the
     # accumulated alpha can exceed opacity_thr (MonoGS creates them at 0.5).
     gaussian_opacity: 0.99
+    # depth_fd stencils compared on the RASTERIZED depth (D40).
+    depth_fd_stencils: [1, 2, 4, 8]
     # Same pixel selection as layer 1 (keys above) is reused.

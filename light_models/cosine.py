@@ -22,10 +22,15 @@ class Lambert:
     can exclude them (they would otherwise be shaded ambient-only)."""
 
     def __init__(self, normal_source):
-        if not isinstance(normal_source, str):
-            raise TypeError(f"Light.cosine.normal_source must be a name, got {normal_source!r}")
+        # A block {type: <normal source>, <its options>}, e.g.
+        # {type: depth_fd, stencil_px: 3} (docs/DECISIONS.md D40).
+        if not isinstance(normal_source, dict):
+            raise TypeError(
+                "Light.cosine.normal_source must be a block {type: ..., <options>}, "
+                f"got {normal_source!r}"
+            )
         self.normals = build_component(
-            "normals", {"type": normal_source}, "Light.cosine.normal_source", None
+            "normals", normal_source, "Light.cosine.normal_source", None
         )
 
     def __call__(self, points, valid, to_light, gbuffer):
