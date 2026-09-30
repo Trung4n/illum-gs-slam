@@ -164,6 +164,7 @@ def test_saturation_configs_resolve(monkeypatch, name, light_enabled):
     "name, light_enabled",
     [
         ("configs/light/4_3_nocos_sat.yaml", True),
+        ("configs/light/4_3_lambert_sat.yaml", True),
         ("configs/light/baseline_satmask_noaffine.yaml", False),
     ],
 )

@@ -65,12 +65,6 @@ def analyze(ids, est, gt, window, ranges):
         "ate_y": rmse(err_cam[:, 1]),
         "ate_z_axis": rmse(err_cam[:, 2]),
     }
-    out["ranges"] = []
-    for lo, hi in ranges:
-        m = (ids >= lo) & (ids < hi)
-        out["ranges"].append(
-            (lo, hi, int(m.sum()), rmse(np.linalg.norm(err[m], axis=1)), rmse(err_cam[m, 2]))
-        )
     # Sliding-window Sim(3): local scale and drift-free local error.
     local_scale = np.full(len(ids), np.nan)
     local_err = np.full(len(ids), np.nan)
@@ -82,6 +76,28 @@ def analyze(ids, est, gt, window, ranges):
         sl, rl, tl = umeyama(p_est[lo:hi], p_gt[lo:hi])
         local_scale[i] = sl / s
         local_err[i] = np.linalg.norm(sl * rl @ p_est[i] + tl - p_gt[i])
+    # Ground-truth motion between consecutive keyframes: translation and
+    # rotation angle. Monocular scale is unobservable when the camera mostly
+    # rotates in place, the usual suspect for local scale excursions.
+    step_t = np.linalg.norm(np.diff(p_gt, axis=0), axis=1)
+    rel_r = np.einsum("nji,njk->nik", gt[:-1, :3, :3], gt[1:, :3, :3])
+    step_rot = np.degrees(np.arccos(np.clip((np.trace(rel_r, axis1=1, axis2=2) - 1) / 2, -1, 1)))
+    out["ranges"] = []
+    for lo, hi in ranges:
+        m = (ids >= lo) & (ids < hi)
+        ms = m[1:] & m[:-1]  # steps whose two keyframes are both in range
+        ls = local_scale[m]
+        ls = ls[~np.isnan(ls)]
+        out["ranges"].append({
+            "lo": lo, "hi": hi, "n": int(m.sum()),
+            "ate": rmse(np.linalg.norm(err[m], axis=1)),
+            "ate_z_axis": rmse(err_cam[m, 2]),
+            "local_ate": rmse(local_err[m][~np.isnan(local_err[m])]),
+            "local_scale_min": float(ls.min()) if len(ls) else float("nan"),
+            "local_scale_max": float(ls.max()) if len(ls) else float("nan"),
+            "gt_path_m": float(step_t[ms].sum()),
+            "gt_rot_deg": float(step_rot[ms].sum()),
+        })
     out["local_scale_rel_min"] = float(np.nanmin(local_scale))
     out["local_scale_rel_max"] = float(np.nanmax(local_scale))
     out["local_ate"] = rmse(local_err[~np.isnan(local_err)])
@@ -120,9 +136,15 @@ def run_report(run_dir, window, range_step):
         f"  RPE {a['rpe']:.4f} m (optical axis {a['rpe_z_axis']:.4f}) | local ATE after "
         f"{window}-keyframe Sim(3) {a['local_ate']:.4f} | local/global scale "
         f"[{a['local_scale_rel_min']:.2f}, {a['local_scale_rel_max']:.2f}]",
-        "  ATE per frame range (total / optical axis):",
+        "  per frame range: ATE total / optical axis | local ATE | local/global scale "
+        "| ground-truth path (m), rotation (deg), rotation per m:",
     ]
-    for lo, hi, n, tot, z in a["ranges"]:
-        if n:
-            lines.append(f"    {lo:5d}-{hi:<5d} n={n:3d}  {tot:.4f} / {z:.4f}")
+    for g in a["ranges"]:
+        if g["n"]:
+            per_m = g["gt_rot_deg"] / g["gt_path_m"] if g["gt_path_m"] > 0 else float("inf")
+            lines.append(
+                f"    {g['lo']:5d}-{g['hi']:<5d} n={g['n']:3d}  {g['ate']:.4f} / {g['ate_z_axis']:.4f}"
+                f" | {g['local_ate']:.4f} | [{g['local_scale_min']:.2f}, {g['local_scale_max']:.2f}]"
+                f" | {g['gt_path_m']:.2f} m, {g['gt_rot_deg']:.0f} deg, {per_m:.0f} deg/m"
+            )
     return lines

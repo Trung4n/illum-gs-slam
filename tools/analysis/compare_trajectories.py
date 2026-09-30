@@ -65,8 +65,8 @@ def main(argv=None):
     for k, (lo, hi) in enumerate(ranges):
         cells = []
         for _, a in results:
-            _, _, n, tot, z = a["ranges"][k]
-            cells.append(f"{tot:9.4f} / {z:8.4f}  " if n else f"{'-':>22s}")
+            g = a["ranges"][k]
+            cells.append(f"{g['ate']:9.4f} / {g['ate_z_axis']:8.4f}  " if g["n"] else f"{'-':>22s}")
         print(f"{lo:5d}-{hi:<5d} " + " ".join(cells))
 
     if args.out:

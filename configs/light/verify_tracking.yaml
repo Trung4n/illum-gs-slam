@@ -1,0 +1,17 @@
+# Settings of tools/verify/tracking_probe.py only (NOT an experiment config:
+# the experiment config, light model or not, is passed separately).
+# docs/DECISIONS.md D39.
+Verify:
+  tracking:
+    # Opacity given to the Gaussians built from ground truth so that the
+    # probe map is opaque like a converged SLAM map (same value as
+    # Verify.layer2.gaussian_opacity in verify_4_2.yaml).
+    gaussian_opacity: 0.99
+    # One Gaussian per valid pixel of the reference frame.
+    pcd_downsample: 1
+    # Reference frames: must be in the exported ground-truth bundle
+    # (tools/verify/export_gt_npy.py).
+    ref_frames: [0, 500, 1000, 1500]
+    # Target frame = reference + offset. Tracking starts from the reference's
+    # ground-truth pose, as FrontEnd.tracking starts from the previous frame.
+    offsets: [1, 2, 4, 8, 16]
