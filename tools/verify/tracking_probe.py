@@ -23,6 +23,7 @@ verification only, never imported by the SLAM path.
 """
 import argparse
 import copy
+import math
 import os
 import sys
 
@@ -36,6 +37,7 @@ import torch  # noqa: E402
 from munch import munchify  # noqa: E402
 from PIL import Image  # noqa: E402
 
+from gaussian_splatting.gaussian_renderer import render  # noqa: E402
 from gaussian_splatting.scene.gaussian_model import GaussianModel  # noqa: E402
 from light_models import build_shader  # noqa: E402
 from utils.camera_utils import Camera, build_projection_matrix  # noqa: E402
@@ -89,7 +91,25 @@ def build_map(config, probe, dataset, proj, ref, bundle, shader):
     )
     with torch.no_grad():
         gaussians._opacity.fill_(float(torch.logit(torch.tensor(probe["gaussian_opacity"]))))
+        # Enlarge the Gaussians so the map covers every pixel like a converged
+        # SLAM map: built on the data's pixel grid they sit half a pixel off
+        # the rasterizer's (D29) and at their creation size cover a pixel only
+        # ~0.95, i.e. about half the pixels fall below the 0.95 trust
+        # threshold of the light model's G-buffer (D41).
+        gaussians._scaling.add_(math.log(probe["gaussian_scale_mult"]))
     return gaussians, cam
+
+
+def coverage_line(gaussians, cam, config, shader, background):
+    with torch.no_grad():
+        pkg = render(cam, gaussians, munchify(config["pipeline_params"]), background, shader=shader)
+    op = pkg["opacity"][0].flatten()
+    line = (f"     map coverage at the reference pose: opacity p5 {op.quantile(0.05):.3f}, "
+            f"median {op.median():.3f}")
+    thr = getattr(shader, "opacity_thr", None)
+    if thr is not None:
+        line += f", trusted by the shader (>= {thr}) {(op >= thr).float().mean():.1%}"
+    return line
 
 
 def main(argv=None):
@@ -107,7 +127,7 @@ def main(argv=None):
     config["Training"]["monocular"] = config["Dataset"]["sensor_type"] == "monocular"
     config["Results"]["save_dir"] = None
     probe = require_key(require_key(load_config(args.probe), "Verify", ""), "tracking", "Verify")
-    for key in ("gaussian_opacity", "pcd_downsample", "ref_frames", "offsets"):
+    for key in ("gaussian_opacity", "gaussian_scale_mult", "pcd_downsample", "ref_frames", "offsets"):
         require_key(probe, key, "Verify.tracking")
 
     model_params = munchify(config["model_params"])
@@ -126,6 +146,7 @@ def main(argv=None):
     rows = []
     for ref in probe["ref_frames"]:
         gaussians, ref_cam = build_map(config, probe, dataset, proj, ref, args.bundle, shader)
+        print(coverage_line(gaussians, ref_cam, config, shader, background))
         for off in probe["offsets"]:
             tgt = ref + off
             if tgt >= len(dataset):

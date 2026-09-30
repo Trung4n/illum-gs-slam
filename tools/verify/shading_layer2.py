@@ -22,6 +22,7 @@ the model, not the code. Needs CUDA.
 import argparse
 import copy
 import json
+import math
 import os
 import sys
 
@@ -65,6 +66,10 @@ def build_map(config, frame_dir, uid, device):
     )
     with torch.no_grad():
         gaussians._opacity.fill_(float(torch.logit(torch.tensor(g_op))))
+        # Enlarged so the map covers every pixel (see tracking_probe.py, D41).
+        gaussians._scaling.add_(
+            math.log(require_key(v2, "gaussian_scale_mult", "Verify.layer2"))
+        )
     return rgb8, z, n_gt, gb, cam, gaussians
 
 
@@ -100,6 +105,17 @@ def check_frame(config, params, frame_dir, uid, device):
         op = pkg["opacity"][0].cpu().numpy()
         mask = base & (op >= thr)
         variants[name] = {r: l1.summarize(pred, rgb8, mask & m) for r, m in regions.items()}
+        if "light_normal_valid" in pkg:
+            # What the loss sees with pixel_weight on: pixels whose normal is
+            # invalid get cos = 0 (ambient only) and are excluded there (D41).
+            nv = pkg["light_normal_valid"][0].cpu().numpy()
+            variants[name + "_normal_valid_only"] = {
+                r: l1.summarize(pred, rgb8, mask & m & nv) for r, m in regions.items()
+            }
+            n_cmp = int(mask.sum())
+            variants[name + "_normal_valid_only"]["normal_valid_frac"] = (
+                float((mask & nv).sum() / n_cmp) if n_cmp else None
+            )
         variants[name]["opacity_ge_thr_frac"] = float((op >= thr).mean())
         variants[name]["opacity_median_selected"] = float(np.median(op[mask])) if mask.any() else None
         # Same prediction as if the map covered the pixel fully (albedo is
@@ -136,6 +152,9 @@ def main(argv=None):
                 print(f"  {variant}: rasterized opacity >= thr on "
                       f"{regions['opacity_ge_thr_frac']:.1%} of the image, median opacity "
                       f"of the compared pixels {regions['opacity_median_selected']:.3f}")
+            elif regions.get("normal_valid_frac") is not None:
+                print(f"  {variant}: valid normal on {regions['normal_valid_frac']:.1%} "
+                      "of the compared pixels")
             else:
                 print(f"  {variant}:")
             for region in ("core", "rim", "outside"):

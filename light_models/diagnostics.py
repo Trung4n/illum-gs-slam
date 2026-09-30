@@ -118,6 +118,8 @@ _PIXEL_USAGE_COLUMNS = (
     "frac_saturated_values",
     "frac_removed_saturation",
     "frac_removed_light_weight",
+    "frac_light_valid",
+    "frac_normal_valid",
     "frac_used_monogs_masks",
     "frac_used_tracking",
 )

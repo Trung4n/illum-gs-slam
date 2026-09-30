@@ -294,6 +294,13 @@ def pixel_usage_stats(config, render_pkg, viewpoint):
         light_w = get_light_pixel_weight(config, render_pkg, "tracking")
         if light_w is not None:
             stats["frac_removed_light_weight"] = 1.0 - frac(light_w)
+        # Light-model G-buffer: pixels whose rasterized depth is trusted
+        # (opacity >= Light.gbuffer.opacity_thr) and, with lambert, whose
+        # normal is valid (D41).
+        if "light_valid" in render_pkg:
+            stats["frac_light_valid"] = float(render_pkg["light_valid"].float().mean())
+        if "light_normal_valid" in render_pkg:
+            stats["frac_normal_valid"] = float(render_pkg["light_normal_valid"].float().mean())
         stats["frac_used_monogs_masks"] = frac(tracking_rgb_mask(config, viewpoint, None))
         weight = get_loss_weight(config, render_pkg, viewpoint, "tracking")
         stats["frac_used_tracking"] = frac(tracking_rgb_mask(config, viewpoint, weight))

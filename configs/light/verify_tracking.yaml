@@ -7,6 +7,10 @@ Verify:
     # probe map is opaque like a converged SLAM map (same value as
     # Verify.layer2.gaussian_opacity in verify_4_2.yaml).
     gaussian_opacity: 0.99
+    # Scale multiplier of those Gaussians so the map covers every pixel like
+    # a converged SLAM map (D41); same value as Verify.layer2 in
+    # verify_4_2.yaml. The probe prints the resulting coverage.
+    gaussian_scale_mult: 3.0
     # One Gaussian per valid pixel of the reference frame.
     pcd_downsample: 1
     # Reference frames: must be in the exported ground-truth bundle

@@ -50,6 +50,11 @@ Verify:
     # Opacity given to the Gaussians built from ground truth, so that the
     # accumulated alpha can exceed opacity_thr (MonoGS creates them at 0.5).
     gaussian_opacity: 0.99
+    # Scale multiplier of those Gaussians so the map covers every pixel
+    # (at creation size, half a pixel off the rasterizer grid, they cover
+    # ~0.95, below the 0.95 trust threshold on about half the pixels, D41).
+    # Starting value; the probe prints the resulting coverage.
+    gaussian_scale_mult: 3.0
     # depth_fd stencils compared on the RASTERIZED depth (D40).
     depth_fd_stencils: [1, 2, 4, 8]
     # Same pixel selection as layer 1 (keys above) is reused.
