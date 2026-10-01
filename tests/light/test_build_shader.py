@@ -249,6 +249,7 @@ _FAKE_PARAMS = {
     "name, cosine",
     [
         ("configs/light/rgbd_baseline_satmask.yaml", None),
+        ("configs/light/rgbd_4_2_nocos_sat.yaml", "none"),
         ("configs/light/rgbd_4_3_nocos_sat.yaml", "none"),
         ("configs/light/rgbd_4_3_lambert_sat.yaml", "lambert"),
     ],
@@ -267,7 +268,7 @@ def test_rgbd_configs(monkeypatch, name, cosine):
     if cosine is None:
         assert cfg["Light"]["enabled"] is False and lt.exposure_affine is True
         return
-    assert lt.exposure_affine is False
+    assert lt.exposure_affine is ("4_2_" in name)
     assert cfg["Light"]["cosine"]["type"] == cosine
     assert type(_build(cfg, _FAKE_PARAMS)).__name__ == "ColocatedShader"
     assert lt.pixel_weight.enabled is (cosine == "lambert")
