@@ -23,6 +23,9 @@ Dataset:
   type: 'realsense'
 
 Training:
+  # RGB-D loss = alpha * photometric + (1 - alpha) * depth L1. 0.95 is the
+  # value original MonoGS used silently when the key was missing (D47).
+  alpha: 0.95
   init_itr_num: 1050
   init_gaussian_update: 100
   init_gaussian_reset: 500

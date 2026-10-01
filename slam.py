@@ -193,6 +193,8 @@ class SLAM:
                 self.save_dir,
                 self.trajectory_analysis["window_kf"],
                 self.trajectory_analysis["range_step_frames"],
+                # Same alignment as eval_ate: Sim(3) only for monocular.
+                with_scale=self.monocular,
             )
         except Exception as exc:  # noqa: BLE001 - logged, run continues
             lines = [f"trajectory analysis failed: {exc!r}"]

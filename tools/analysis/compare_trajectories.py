@@ -2,19 +2,21 @@
 runs beyond the single ATE RMSE (CLAUDE.md section 9, step 4.3: "ATE should
 drop, especially along the optical axis").
 
-    python tools/analysis/compare_trajectories.py \
+    python tools/analysis/compare_trajectories.py --align sim3|se3 \
         --run baseline=results/office0_lit/<t1> --run light=results/office0_lit/<t2> \
         [--window 30] [--out analysis_dir]
 
 Reads <run>/plot/trj_final.json (written by utils/eval_utils.eval_ate:
 camera-to-world poses of every keyframe, estimated and ground truth). For
 each run:
-  - global Sim(3) alignment (Umeyama with scale, as evo's correct_scale for
-    monocular), ATE RMSE (cross-checked against plot/stats_final.json);
+  - global alignment as utils/eval_utils.evaluate_evo: Sim(3) (Umeyama with
+    scale, evo's correct_scale) for monocular runs, SE(3) for RGB-D (--align,
+    required: it must match how the run was evaluated); ATE RMSE
+    (cross-checked against plot/stats_final.json);
   - the aligned position error expressed in the GROUND-TRUTH camera frame:
     x = right, y = down, z = along the optical axis (OpenCV);
   - the error per range of frames (does it grow steadily or jump?);
-  - scale drift: Sim(3) fitted on sliding windows of --window keyframes,
+  - scale drift (always 1 with --align se3): fitted on sliding windows of --window keyframes,
     local scale relative to the global one, and the local ATE after that
     local alignment (error that is NOT explained by drift);
   - RPE between consecutive keyframes (after the global scale), total and
@@ -39,7 +41,9 @@ from utils.trajectory_analysis import analyze, frame_ranges, load_run  # noqa: E
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--run", action="append", required=True, help="label=run_dir")
-    ap.add_argument("--window", type=int, default=30, help="keyframes per local Sim(3) window")
+    ap.add_argument("--align", choices=("sim3", "se3"), required=True,
+                    help="sim3 for monocular runs (evo correct_scale), se3 for RGB-D")
+    ap.add_argument("--window", type=int, default=30, help="keyframes per local alignment window")
     ap.add_argument("--range-step", type=int, default=250, help="frames per reporting range")
     ap.add_argument("--out", default=None)
     args = ap.parse_args(argv)
@@ -54,7 +58,7 @@ def main(argv=None):
     print(f"{'run':24s} {'kf':>4s} {'ATE':>7s} {'saved':>7s} {'x':>7s} {'y':>7s} "
           f"{'z(axis)':>8s} {'RPE':>7s} {'RPE_z':>7s} {'localATE':>8s} {'scale drift':>14s}")
     for label, (ids, est, gt, saved) in runs:
-        a = analyze(ids, est, gt, args.window, ranges)
+        a = analyze(ids, est, gt, args.window, ranges, with_scale=args.align == "sim3")
         results.append((label, a))
         saved_s = f"{saved:.4f}" if saved is not None else "-"
         print(f"{label:24s} {a['n_kf']:4d} {a['ate']:7.4f} {saved_s:>7s} {a['ate_x']:7.4f} "

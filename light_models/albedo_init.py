@@ -132,6 +132,24 @@ def _rendered_depth(params, config, viewpoint, placement_depth, *, shader, rende
     return _deshade(params, config, viewpoint, z, shader)
 
 
+def _placement_depth(params, config, viewpoint, placement_depth, *, shader, render_keyframe):
+    # De-shading pixel by pixel at the placement depth itself. Only valid when
+    # that depth is MEASURED: RGB-D, where FrontEnd.add_new_keyframe passes
+    # the keyframe's sensor depth unchanged (D47). get_albedo_init refuses it
+    # for monocular, whose placement depth is a noisy guess (D33). Pixels
+    # without a measurement (0) are shaded at the shader's fallback depth;
+    # they receive no Gaussian anyway.
+    z = _placement_depth_tensor(placement_depth)
+    if not (z > 0).any():
+        raise ValueError("init_albedo placement_depth: the placement depth has no valid pixel")
+    return _deshade(params, config, viewpoint, z, shader)
+
+
+# Strategies that trust the placement depth pixel by pixel: refused when it
+# is a guess (Dataset.sensor_type monocular).
+_MEASURED_DEPTH_ONLY = frozenset({"placement_depth"})
+
+
 def _positive_min_shading(params):
     v = params["min_shading"]
     if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
@@ -145,6 +163,7 @@ _REGISTRY = {
     "observed": (_observed, frozenset(), None),
     "median_depth": (_median_depth, frozenset({"min_shading"}), _positive_min_shading),
     "rendered_depth": (_rendered_depth, frozenset({"min_shading"}), _positive_min_shading),
+    "placement_depth": (_placement_depth, frozenset({"min_shading"}), _positive_min_shading),
 }
 
 
@@ -172,6 +191,14 @@ def get_albedo_init(config):
         )
     if validate is not None:
         validate(settings.params)
+    if settings.strategy in _MEASURED_DEPTH_ONLY:
+        dataset = require_key(config, "Dataset", "")
+        if require_key(dataset, "sensor_type", "Dataset") == "monocular":
+            raise ValueError(
+                f"Light.init_albedo.strategy '{settings.strategy}' needs a measured "
+                "depth; with Dataset.sensor_type monocular the placement depth is a "
+                "guess (docs/DECISIONS.md D33). Use rendered_depth or median_depth."
+            )
 
     def init_albedo(config, viewpoint, placement_depth, *, shader, render_keyframe):
         with torch.no_grad():

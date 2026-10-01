@@ -2,6 +2,7 @@ import torch
 
 from light_models import read_light_tracking
 from utils.color_space import sRGB2Linear
+from utils.config_utils import require_key
 
 # Loss functions and image helpers shared by tracking (FrontEnd) and mapping
 # (BackEnd). All losses are plain masked L1 photometric (+ optional depth)
@@ -322,9 +323,10 @@ def pixel_usage_stats(config, render_pkg, viewpoint):
 
 def get_loss_tracking_rgbd(config, image, gt_image, depth, opacity, viewpoint, pixel_weight):
     # RGB-D tracking loss = alpha * photometric + (1 - alpha) * depth L1.
-    # alpha (config Training.alpha, default 0.95) balances the two terms;
-    # TUM RGB-D configs set 0.9 to lean more on depth.
-    alpha = config["Training"]["alpha"] if "alpha" in config["Training"] else 0.95
+    # alpha (Training.alpha) balances the two terms; TUM RGB-D configs set
+    # 0.9 to lean more on depth. Required: original MonoGS silently used 0.95
+    # when the key was missing, now written in the configs (D47).
+    alpha = require_key(config["Training"], "alpha", "Training")
 
     gt_depth = torch.from_numpy(viewpoint.depth).to(
         dtype=torch.float32, device=image.device
@@ -393,7 +395,7 @@ def get_loss_mapping_rgbd(config, image, gt_image, depth, viewpoint, pixel_weigh
     # Same idea as get_loss_mapping_rgb: no opacity mask on the depth term
     # (unlike tracking), because holes in the map are exactly what mapping
     # should fill using the sensor depth.
-    alpha = config["Training"]["alpha"] if "alpha" in config["Training"] else 0.95
+    alpha = require_key(config["Training"], "alpha", "Training")
     rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
 
     observed = viewpoint.original_image.cuda()

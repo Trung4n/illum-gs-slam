@@ -216,3 +216,72 @@ def test_lambert_opacity_and_weight_ablations(monkeypatch):
     assert read_light_tracking(op).pixel_weight.apply_to == ("tracking", "mapping")
     assert read_light_tracking(mw).pixel_weight.apply_to == ("mapping",)
     assert read_light_tracking(mw).exposure_affine is False
+
+
+@pytest.mark.parametrize(
+    "path",
+    sorted(
+        glob.glob(os.path.join(REPO, "configs", "**", "base_config.yaml"), recursive=True)
+        + glob.glob(os.path.join(REPO, "configs", "live", "*.yaml"))
+    ),
+)
+def test_every_depth_config_states_alpha(path):
+    # The RGB-D loss requires Training.alpha (D47); original MonoGS silently
+    # used 0.95 when it was missing, so that is the value a config without
+    # one had (TUM / EuRoC state their own 0.9).
+    with open(path, "r") as f:
+        cfg = yaml.full_load(f)
+    if cfg["Dataset"]["sensor_type"] == "monocular":
+        return
+    assert isinstance(cfg["Training"]["alpha"], float), path
+
+
+_FAKE_PARAMS = {
+    "intensity": {"K_estimated_step3": 30.0},
+    "t_CL_m": {"estimated_opencv": [0.0, -0.05, 0.0]},
+    "R_CL": {"estimated": [[1, 0, 0], [0, 1, 0], [0, 0, 1]]},
+    "cone": {"half_angle_deg_estimated": 30.0, "blend_estimated": 0.35},
+    "ambient": {"c_estimated": 0.12},
+}
+
+
+@pytest.mark.parametrize(
+    "name, cosine",
+    [
+        ("configs/light/rgbd_baseline_satmask.yaml", None),
+        ("configs/light/rgbd_4_3_nocos_sat.yaml", "none"),
+        ("configs/light/rgbd_4_3_lambert_sat.yaml", "lambert"),
+    ],
+)
+def test_rgbd_configs(monkeypatch, name, cosine):
+    from light_models import build_shader as _build, read_light_tracking
+    from utils.config_utils import load_config
+
+    monkeypatch.chdir(REPO)
+    cfg = load_config(name)
+    assert cfg["Dataset"]["sensor_type"] == "depth"
+    assert cfg["Training"]["alpha"] == 0.95
+    lt = read_light_tracking(cfg)
+    base = read_light_tracking(load_config("configs/light/baseline_satmask.yaml"))
+    assert lt.saturation_mask.threshold_8bit == base.saturation_mask.threshold_8bit
+    if cosine is None:
+        assert cfg["Light"]["enabled"] is False and lt.exposure_affine is True
+        return
+    assert lt.exposure_affine is False
+    assert cfg["Light"]["cosine"]["type"] == cosine
+    assert type(_build(cfg, _FAKE_PARAMS)).__name__ == "ColocatedShader"
+    assert lt.pixel_weight.enabled is (cosine == "lambert")
+
+
+def test_rgbd_albedo_init_resolves_and_is_refused_for_monocular(monkeypatch):
+    pytest.importorskip("torch")
+    from light_models.albedo_init import get_albedo_init
+    from utils.config_utils import load_config
+
+    monkeypatch.chdir(REPO)
+    cfg = load_config("configs/light/rgbd_4_3_lambert_sat.yaml")
+    assert cfg["Light"]["init_albedo"]["strategy"] == "placement_depth"
+    get_albedo_init(cfg)
+    cfg["Dataset"]["sensor_type"] = "monocular"
+    with pytest.raises(ValueError, match="measured"):
+        get_albedo_init(cfg)

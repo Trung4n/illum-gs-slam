@@ -63,7 +63,9 @@ def build_shader(config, params_data=None):
 #   observed       - albedo = linearized observation, shading taken as 1.
 #   median_depth   - observation / shading at the keyframe's median depth.
 #   rendered_depth - observation / shading at the depth rendered from the map.
-ALBEDO_INIT_STRATEGIES = ("observed", "median_depth", "rendered_depth")
+#   placement_depth - observation / shading at the measured placement depth
+#                    (RGB-D sensor depth); refused for monocular.
+ALBEDO_INIT_STRATEGIES = ("observed", "median_depth", "rendered_depth", "placement_depth")
 
 
 def read_albedo_init(config):
