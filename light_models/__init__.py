@@ -54,7 +54,19 @@ def build_shader(config, params_data=None):
             return params_data
         return load_params_file(params_file_path(config))
 
-    return make_shader(config["Light"], load_params)
+    shader = make_shader(config["Light"], load_params)
+    if shader.requires_sensor_depth:
+        # A component reads the observed frame's sensor depth (e.g. normal
+        # source sensor_depth_fd, D49). In monocular, Camera.depth is still
+        # loaded (D20) but is ground truth, not a sensor: refuse.
+        dataset = require_key(config, "Dataset", "")
+        sensor = require_key(dataset, "sensor_type", "Dataset")
+        if sensor == "monocular":
+            raise ValueError(
+                "The light model reads the sensor depth (normal source "
+                "sensor_depth_fd), which needs Dataset.sensor_type depth, got monocular"
+            )
+    return shader
 
 
 # Strategies for the albedo of newly created Gaussians (docs/DECISIONS.md D7).

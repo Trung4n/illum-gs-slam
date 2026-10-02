@@ -252,6 +252,7 @@ _FAKE_PARAMS = {
         ("configs/light/rgbd_4_2_nocos_sat.yaml", "none"),
         ("configs/light/rgbd_4_3_nocos_sat.yaml", "none"),
         ("configs/light/rgbd_4_3_lambert_sat.yaml", "lambert"),
+        ("configs/light/rgbd_4_3_lambert_sensor_sat.yaml", "lambert"),
     ],
 )
 def test_rgbd_configs(monkeypatch, name, cosine):
@@ -286,3 +287,48 @@ def test_rgbd_albedo_init_resolves_and_is_refused_for_monocular(monkeypatch):
     cfg["Dataset"]["sensor_type"] = "monocular"
     with pytest.raises(ValueError, match="measured"):
         get_albedo_init(cfg)
+
+
+def test_sensor_depth_normals_refused_for_monocular(monkeypatch):
+    # sensor_depth_fd reads Camera.depth: a sensor in RGB-D, ground truth in
+    # monocular (loaded anyway, D20), so the builder refuses it there (D49).
+    pytest.importorskip("torch")
+    from utils.config_utils import load_config
+
+    monkeypatch.chdir(REPO)
+    cfg = load_config("configs/light/rgbd_4_3_lambert_sensor_sat.yaml")
+    assert cfg["Light"]["cosine"]["normal_source"]["type"] == "sensor_depth_fd"
+    assert build_shader(cfg, _FAKE_PARAMS).requires_sensor_depth is True
+    cfg["Dataset"]["sensor_type"] = "monocular"
+    with pytest.raises(ValueError, match="monocular"):
+        build_shader(cfg, _FAKE_PARAMS)
+    # The other normal sources do not read the sensor.
+    nocos = load_config("configs/light/rgbd_4_3_lambert_sat.yaml")
+    nocos["Dataset"]["sensor_type"] = "monocular"
+    assert build_shader(nocos, _FAKE_PARAMS).requires_sensor_depth is False
+
+
+def test_sensor_and_map_normals_agree_on_a_smooth_map(monkeypatch):
+    # When the rasterized depth IS the sensor depth (smooth, same pixel
+    # convention), both normal sources must shade identically: the only
+    # difference between the two configs is where n comes from.
+    torch = pytest.importorskip("torch")
+    from types import SimpleNamespace
+
+    from utils.config_utils import load_config
+
+    monkeypatch.chdir(REPO)
+    h, w = 24, 32
+    v, u = torch.meshgrid(torch.arange(h, dtype=torch.float64),
+                          torch.arange(w, dtype=torch.float64), indexing="ij")
+    z = 2.0 / (1.0 - 0.3 * (u - w / 2) / 40.0 + 0.2 * (v - h / 2) / 40.0)
+    cam = SimpleNamespace(fx=40.0, fy=40.0, cx=w / 2, cy=h / 2, depth=z.numpy().copy())
+    g = {"albedo": torch.full((3, h, w), 0.5, dtype=torch.float64), "depth": z[None],
+         "opacity": torch.ones(1, h, w, dtype=torch.float64), "pixel_offset": 0.0}
+    out = {}
+    for name in ("rgbd_4_3_lambert_sat", "rgbd_4_3_lambert_sensor_sat"):
+        shader = build_shader(load_config(f"configs/light/{name}.yaml"), _FAKE_PARAMS)
+        out[name] = shader(g, cam)
+    a, b = out["rgbd_4_3_lambert_sat"], out["rgbd_4_3_lambert_sensor_sat"]
+    assert torch.equal(a["light_normal_valid"], b["light_normal_valid"])
+    torch.testing.assert_close(a["radiance_linear"], b["radiance_linear"])

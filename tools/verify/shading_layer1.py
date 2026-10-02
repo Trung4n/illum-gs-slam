@@ -106,7 +106,7 @@ def selection(config, rgb8, albedo_lin, z, n_gt, cos_nl, pts):
     planar = require_key(v1, "planar_deg", "Verify.layer1")
     valid = z > 0
     # check_physics.py's planar test uses 1-pixel differences (common.depth_normals).
-    n_fd, n_fd_ok = DepthFiniteDifference(stencil_px=1)(pts, torch.from_numpy(valid), None)
+    n_fd, n_fd_ok = DepthFiniteDifference(stencil_px=1)(pts, torch.from_numpy(valid), None, None)
     cos_ang = (n_fd.permute(1, 2, 0).numpy() * n_gt).sum(-1).clip(-1, 1)
     is_planar = n_fd_ok.numpy() & (np.degrees(np.arccos(cos_ang)) < planar)
     return (

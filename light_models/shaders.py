@@ -26,6 +26,8 @@ class IdentityShader:
     color path (storage, conversion, init), not at the light model.
     """
 
+    requires_sensor_depth = False
+
     def __call__(self, gbuffer, viewpoint_camera):
         return {"radiance_linear": gbuffer["albedo"]}
 

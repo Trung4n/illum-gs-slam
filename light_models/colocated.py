@@ -70,6 +70,8 @@ class ColocatedShader:
         self.cosine = build_component(
             "cosine", require_key(light_cfg, "cosine", where), "Light.cosine", params_data
         )
+        # Checked against Dataset.sensor_type by light_models.build_shader.
+        self.requires_sensor_depth = self.cosine.requires_sensor_depth
         self.ambient = build_component(
             "ambient", require_key(light_cfg, "ambient", where), "Light.ambient", params_data
         )
@@ -107,7 +109,7 @@ class ColocatedShader:
 
         phi = self.angular(cos_theta)
         fall = self.falloff(dist)
-        cos_term, aux = self.cosine(points, valid, to_light, gbuffer)
+        cos_term, aux = self.cosine(points, valid, to_light, gbuffer, viewpoint_camera)
         k = self.intensity.to(dev, dt)
         direct = k * (phi * fall * cos_term)
         radiance = self.ambient(albedo, direct)

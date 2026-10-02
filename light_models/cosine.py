@@ -11,7 +11,9 @@ from light_models.registry import build_component, declare_planned, register
 class NoCosine:
     """Factor 1: the direct term ignores surface orientation."""
 
-    def __call__(self, points, valid, to_light, gbuffer):
+    requires_sensor_depth = False
+
+    def __call__(self, points, valid, to_light, gbuffer, camera):
         return torch.ones_like(valid, dtype=points.dtype), {}
 
     def set_keyframe_count(self, n):
@@ -56,16 +58,17 @@ class Lambert:
         self.normals = build_component(
             "normals", normal_source, "Light.cosine.normal_source", None
         )
+        self.requires_sensor_depth = self.normals.requires_sensor_depth
 
     def set_keyframe_count(self, n):
         self.active = n > self.warmup_keyframes
 
-    def __call__(self, points, valid, to_light, gbuffer):
+    def __call__(self, points, valid, to_light, gbuffer, camera):
         if not self.active:
             # Warm-up: no n . l, and no cos map (the loss sees no pixel weight).
             ones = torch.ones_like(valid, dtype=points.dtype)
             return ones, {"cosine_warmup": torch.ones_like(valid)}
-        n, n_valid = self.normals(points, valid, gbuffer)
+        n, n_valid = self.normals(points, valid, gbuffer, camera)
         cos_nl = (n * to_light).sum(0)
         cos_nl = torch.where(n_valid, cos_nl, torch.zeros_like(cos_nl))
         return cos_nl.clamp_min(0.0), {"cos_nl": cos_nl, "normal_valid": n_valid}
