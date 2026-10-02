@@ -332,3 +332,21 @@ def test_sensor_and_map_normals_agree_on_a_smooth_map(monkeypatch):
     a, b = out["rgbd_4_3_lambert_sat"], out["rgbd_4_3_lambert_sensor_sat"]
     assert torch.equal(a["light_normal_valid"], b["light_normal_valid"])
     torch.testing.assert_close(a["radiance_linear"], b["radiance_linear"])
+
+
+def test_rgbd_nocos_without_saturation_mask(monkeypatch):
+    # Ablation of the main model (D52): identical to rgbd_4_3_nocos_sat
+    # except the saturation mask.
+    from light_models import read_light_tracking
+    from utils.config_utils import load_config
+
+    monkeypatch.chdir(REPO)
+    off = load_config("configs/light/rgbd_4_3_nocos.yaml")
+    on = load_config("configs/light/rgbd_4_3_nocos_sat.yaml")
+    assert read_light_tracking(off).saturation_mask.enabled is False
+    assert read_light_tracking(on).saturation_mask.enabled is True
+    off["LightTracking"].pop("saturation_mask")
+    on["LightTracking"].pop("saturation_mask")
+    off.pop("inherit_from")
+    on.pop("inherit_from")
+    assert off == on
